@@ -1,0 +1,38 @@
+[project]
+name = "fb-cloning"
+version = "0.1.0"
+description = "Facebook Auto Poster + Content Downloader - Automates posting to Facebook Pages with YouTube/Instagram/TikTok video downloads"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "apscheduler>=3.10.0",
+    "bs4>=0.0.2",
+    "click>=8.1.0",
+    "colorama>=0.4.6",
+    "facebook-business>=21.0.0",
+    "python-dateutil>=2.8.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+    "questionary>=2.0.0",
+    "requests>=2.31.0",
+    "rich>=13.0.0",
+    "tqdm>=4.66.0",
+    "yt-dlp>=2024.1.0",
+    "ffmpeg-python>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "mypy>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

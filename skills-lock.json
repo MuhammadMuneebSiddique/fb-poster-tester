@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "skills": {
+    "apscheduler": {
+      "source": "slanycukr/riot-api-project",
+      "sourceType": "github",
+      "skillPath": ".claude/skills/backend/apscheduler/SKILL.md",
+      "computedHash": "8915d547cea685b26d6524a60bebe93c5fc3db41392852f0683234057fc4ae6b"
+    },
+    "license-keys": {
+      "source": "dodopayments/skills",
+      "sourceType": "github",
+      "skillPath": "dodo-payments/license-keys/SKILL.md",
+      "computedHash": "df2ba540572bcd63557a3d26e766420eea8611b563ad402e6cadf6dd3958dd0b"
+    },
+    "termux-system": {
+      "source": "perminder-klair/ruuh",
+      "sourceType": "github",
+      "skillPath": "agent/.pi/skills/termux-system/SKILL.md",
+      "computedHash": "de424c0b6621b45b6d30cc32fb7cd3ea7406a1b111df512e23649d92c82bdfa6"
+    },
+    "yt-dlp": {
+      "source": "lwmxiaobei/yt-dlp-skill",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "e00cfa7889c5a27c49cbb42a4b42086fe58a324002d566095b1f56b32f36c3b9"
+    }
+  }
+}

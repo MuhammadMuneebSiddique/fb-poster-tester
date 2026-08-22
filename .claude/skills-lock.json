@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "facebook-automation": {
+      "source": "aaaaqwq/claude-code-skills",
+      "sourceType": "github",
+      "skillPath": "skills/facebook-automation/SKILL.md",
+      "computedHash": "e8f9c3aed1e39407bcd1b4057fc2c4a2fe3afa6546b5dbee64451b7f4b0f38eb"
+    }
+  }
+}
