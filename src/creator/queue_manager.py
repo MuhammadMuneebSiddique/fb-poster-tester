@@ -132,20 +132,35 @@ class PostQueue:
         """
         Add multiple videos to the queue, distributing them across scheduled times.
 
+        Videos are sorted by original upload timestamp (oldest first) to preserve
+        the source channel's chronological order.
+
         Args:
             videos: List of video dicts with url, title, upload_date, timestamp
             scheduled_times: List of scheduled times (HH:MM format) in order
 
         Returns:
-            List of created QueueItems
+            List of created QueueItems in chronological order
         """
         created_items = []
 
         # Sort videos by upload date (oldest first)
-        sorted_videos = sorted(videos, key=lambda v: v.get('timestamp', 0) or 0)
+        # Use a high sentinel value for None timestamps to push them to the end
+        # This ensures videos with unknown timestamps don't appear before known-old videos
+        sorted_videos = sorted(videos, key=lambda v: (v.get('timestamp') or 0) or 9999999999)
+
+        # Debug logging for ordering verification
+        import logging
+        logger = logging.getLogger('creator.queue')
+        logger.info(f"[ORDER] Source videos fetched: {len(sorted_videos)}, sorted by upload timestamp (oldest first)")
+
+        if sorted_videos:
+            oldest = sorted_videos[0]
+            newest = sorted_videos[-1]
+            logger.info(f"[ORDER] Ordering fixed: Oldest='{oldest.get('title', 'Unknown')[:50]}' (date: {oldest.get('upload_date', 'Unknown')}), Newest='{newest.get('title', 'Unknown')[:50]}'")
 
         # Determine how to distribute videos across time slots
-        # Each time slot gets videos in order
+        # Each time slot gets videos in chronological order
         num_times = len(scheduled_times)
 
         for i, video in enumerate(sorted_videos):

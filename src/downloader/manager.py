@@ -1,19 +1,26 @@
 """
 Video Downloader Module
-Handles downloading content from Instagram, TikTok, and other platforms using yt-dlp.
+Handles downloading content from Instagram, TikTok, and other platforms.
+Uses platform-specific libraries: yt-dlp for YouTube, rapidok for TikTok,
+and instaloader for Instagram.
+
+TikTok downloading uses rapidok.main.download_from_url() which internally
+uses yt-dlp but provides TikTok-specific handling and output organization.
 """
 
-import os
 import json
 import logging
 import subprocess
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import uuid
+
+from rapidok.main import download_from_url
+import instaloader
 
 
 class Platform(Enum):
@@ -51,9 +58,199 @@ class DownloadedContent:
     error_message: str = ""
 
 
+def _create_tiktok_download_args(download_folder: Path) -> Any:
+    """
+    Create a minimal args namespace for rapidok download_from_url().
+
+    rapidok.main.download_from_url() expects an args object with attributes:
+    - output_dir: base output directory
+    - skip_existing: whether to skip existing files
+    - no_rate_limit: whether to disable rate limiting
+    - no_watermark: whether to download without watermarks
+    - throttle_rate: download speed limit
+    - save_metadata: whether to save metadata (accessed by rapidok)
+    """
+
+    class _Args:
+        def __init__(self, download_folder: Path):
+            self.output_dir = str(download_folder)
+            self.skip_existing = False
+            self.no_rate_limit = False
+            self.no_watermark = True  # Default: download without watermarks
+            self.throttle_rate = None
+            self.save_metadata = False  # rapidok accesses this attribute
+
+    args = _Args(download_folder)
+    return args
+
+
+def _download_tiktok_with_rapidok(url: str, downloader: 'VideoDownloader') -> Optional[Path]:
+    """
+    Download a TikTok video using rapidok.
+
+    Uses rapidok.main.download_from_url() which internally uses yt-dlp
+    but is the recommended library for TikTok downloading.
+
+    Args:
+        url: TikTok video URL
+        downloader: VideoDownloader instance for folder path
+
+    Returns:
+        Path to the downloaded media file, or None on failure
+    """
+    import re
+
+    try:
+        # Create args for rapidok
+        args = _create_tiktok_download_args(downloader.download_folder)
+
+        # Extract username and video ID from URL BEFORE downloading
+        # URL format: https://www.tiktok.com/@username/video/VIDEO_ID
+        username_match = re.search(r'@([a-zA-Z0-9_.]+)', url)
+        video_id_match = re.search(r'/video/([0-9a-zA-Z]+)', url)
+
+        if not username_match or not video_id_match:
+            downloader.logger.error(f"Could not extract username/video_id from TikTok URL: {url}")
+            return None
+
+        username = username_match.group(1)
+        video_id = video_id_match.group(1)
+
+        # Track the expected output directory and file pattern
+        expected_dir = downloader.download_folder / username
+        expected_pattern = f"{video_id}.*"
+
+        # Call rapidok download function
+        download_from_url(
+            link=url,
+            watermark=False,  # No watermarks by default
+            args=args,
+            delay_min=1.0,
+            delay_max=3.0
+        )
+
+        # rapidok saves to {output_dir}/{username}/{video_id}.{ext}
+        # Look SPECIFICALLY for the file matching the current video ID
+        if expected_dir.exists():
+            # Find the exact file for this video ID
+            candidate_files = list(expected_dir.glob(f"{video_id}.*"))
+            media_files = [f for f in candidate_files if f.is_file() and f.suffix.lower() in ['.mp4', '.webm', '.mkv', '.m4a', '.mp3', '.jpg', '.jpeg'] and f.stat().st_size > 0]
+
+            if media_files:
+                # Return the main media file (largest among matches for this video ID)
+                main_file = max(media_files, key=lambda f: f.stat().st_size)
+                downloader.logger.info(
+                    f" rapidok downloaded TikTok video to: {main_file} (video_id={video_id})"
+                )
+                return main_file
+
+        downloader.logger.warning(f" rapidok download completed but file not found for video_id={video_id}")
+        return None
+
+    except Exception as e:
+        downloader.logger.error(f" rapidok TikTok download failed: {e}")
+        return None
+
+
+def _download_instagram_with_instaloader(url: str, downloader: 'VideoDownloader') -> Optional[Path]:
+    """
+    Download an Instagram reel/post using instaloader.
+
+    Uses instaloader.Instaloader.download_post() to download the media.
+
+    Args:
+        url: Instagram reel/post URL (e.g., https://www.instagram.com/reel/Shortcode/)
+        downloader: VideoDownloader instance for folder path
+
+    Returns:
+        Path to the downloaded media file, or None on failure
+    """
+    try:
+        # Extract shortcode from URL
+        # Supported formats:
+        # - https://www.instagram.com/reel/Shortcode/
+        # - https://www.instagram.com/p/Shortcode/
+        # - https://www.instagram.com/tv/Shortcode/
+        shortcode = None
+        import re
+
+        # Try to extract shortcode from various URL formats
+        reel_match = re.search(r'instagram\.com/reel/([a-zA-Z0-9_]+)', url)
+        post_match = re.search(r'instagram\.com/p/([a-zA-Z0-9_]+)', url)
+        tv_match = re.search(r'instagram\.com/tv/([a-zA-Z0-9_]+)', url)
+
+        if reel_match:
+            shortcode = reel_match.group(1)
+        elif post_match:
+            shortcode = post_match.group(1)
+        elif tv_match:
+            shortcode = tv_match.group(1)
+
+        if not shortcode:
+            downloader.logger.warning(f"Could not extract shortcode from Instagram URL: {url}")
+            return None
+
+        # Create instaloader instance
+        L = instaloader.Instaloader(
+            quiet=True,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+        )
+
+        # Get post from shortcode
+        try:
+            post = instaloader.Post.from_shortcode(L.context, shortcode)
+        except Exception as e:
+            downloader.logger.error(f" instaloader failed to fetch post {shortcode}: {e}")
+            return None
+
+        # Download post - target is the download folder
+        # instaloader will save the file with a name based on shortcode
+        downloader.logger.info(f"Downloading Instagram reel {shortcode} with instaloader...")
+        downloaded = L.download_post(post, target=str(downloader.download_folder))
+
+        if not downloaded:
+            downloader.logger.warning(" instaloader download returned False")
+            return None
+
+        # Find the downloaded file in the download folder
+        # instaloader saves files in the target directory
+        # Look for mp4 or video files
+        media_files = list(downloader.download_folder.rglob("*"))
+        media_files = [f for f in media_files if f.is_file() and f.suffix.lower() in ['.mp4', '.webm'] and f.stat().st_size > 0]
+
+        if not media_files:
+            # Also check subdirectories
+            for subdir in downloader.download_folder.rglob("*"):
+                if subdir.is_dir():
+                    for f in subdir.rglob("*"):
+                        if f.is_file() and f.suffix.lower() in ['.mp4', '.webm'] and f.stat().st_size > 0:
+                            media_files.append(f)
+
+        if not media_files:
+            downloader.logger.warning(" instaloader download completed but no media file found")
+            return None
+
+        # Return the largest media file
+        main_file = max(media_files, key=lambda f: f.stat().st_size)
+        downloader.logger.info(f" instaloader downloaded Instagram media to: {main_file}")
+        return main_file
+
+    except ImportError as e:
+        downloader.logger.error(f" instaloader import failed: {e}")
+        return None
+    except Exception as e:
+        downloader.logger.error(f" instaloader Instagram download failed: {e}")
+        return None
+
+
 class VideoDownloader:
     """
-    Downloads videos and content from Instagram, TikTok, and other platforms using yt-dlp.
+    Downloads videos and content from Instagram, TikTok, and other platforms.
+    Uses platform-specific libraries: yt-dlp for YouTube, rapidok for TikTok,
+    and instaloader for Instagram.
     """
 
     def __init__(
@@ -127,6 +324,11 @@ class VideoDownloader:
         """
         Download content from a URL.
 
+        Uses platform-specific downloaders:
+        - YouTube: yt-dlp
+        - TikTok: rapidok
+        - Instagram: instaloader
+
         Args:
             url: Video/post URL to download
             custom_title: Optional custom title
@@ -139,16 +341,278 @@ class VideoDownloader:
         platform = self.detect_platform(url)
         self.logger.info(f"Downloading from {platform.value}: {url}")
 
-        # Check for cookies.txt file if needed for YouTube
-        if self.use_cookies_file and platform == Platform.YOUTUBE:
+        # Generate unique ID for this download
+        download_id = str(uuid.uuid4())[:12]
+
+        # Platform-specific download dispatch
+        if platform == Platform.TIKTOK:
+            return self._download_tiktok(url, download_id, custom_title)
+        elif platform == Platform.INSTAGRAM:
+            return self._download_instagram(url, download_id, custom_title)
+        else:
+            return self._download_youtube(url, download_id, quality, extract_audio, custom_title)
+
+    def _build_command(
+        self,
+        url: str,
+        output_dir: Path,
+        quality: str,
+        extract_audio: bool
+    ) -> List[str]:
+        """Build yt-dlp command."""
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--write-info-json",
+            "--write-thumbnail",
+            "--no-warnings",
+            "-o", str(output_dir / "%(title)s.%(ext)s"),
+        ]
+
+        # Add cookies file when enabled to bypass bot detection
+        if self.use_cookies_file and ("youtube.com" in url or "youtu.be" in url or "yt.be" in url):
+            cmd.extend(["--cookies", self.cookies_file])
+            self.logger.info(f"Using cookies file: {self.cookies_file} for YouTube authentication")
+
+        # Quality settings - Robust format selection that works for YouTube Shorts and regular videos
+        # YouTube Shorts require special handling - they have formats but height filters can fail
+        if extract_audio or quality == "audio":
+            cmd.extend([
+                "-x",
+                "--audio-format", "mp3",
+                "--audio-quality", "192K",
+            ])
+            cmd.extend(["-f", "best[height<=1080]/best"])
+        elif quality == "1080p":
+            # For YouTube Shorts, use combined format first (avoids "Requested format is not available")
+            # The format chain tries: 1080p combined -> best up to 1080 -> best overall
+            cmd.extend(["-f", "best[height<=1080]/best[height<=1080]/best"])
+        elif quality == "720p":
+            cmd.extend(["-f", "best[height<=720]/best[height<=720]/best"])
+        elif quality == "480p":
+            cmd.extend(["-f", "best[height<=480]/best[height<=480]/best"])
+        else:
+            # Default: best format - yt-dlp automatically picks the optimal format for each video
+            cmd.extend(["-f", "best"])
+
+        # YouTube-specific options only (TikTok/Instagram now use rapidok/instaloader)
+        if "youtube.com" in url or "youtu.be" in url or "yt.be" in url:
+            cmd.extend([
+                "--extractor-args", "youtube:player_client=android",
+            ])
+
+        cmd.append(url)
+        return cmd
+
+    def _get_mime_type(self, file_path: Path) -> str:
+        """Get MIME type from file extension."""
+        ext = file_path.suffix.lower()
+        mime_map = {
+            '.mp4': 'video/mp4',
+            '.mov': 'video/quicktime',
+            '.avi': 'video/x-msvideo',
+            '.mkv': 'video/x-matroska',
+            '.webm': 'video/webm',
+            '.mp3': 'audio/mpeg',
+            '.m4a': 'audio/mp4',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.webp': 'image/webp',
+        }
+        return mime_map.get(ext, 'application/octet-stream')
+
+    def _create_failed_content(
+        self,
+        download_id: str,
+        platform: Platform,
+        url: str,
+        error_message: str
+    ) -> DownloadedContent:
+        """Create a failed download record."""
+        content = DownloadedContent(
+            id=download_id,
+            platform=platform,
+            original_url=url,
+            title="",
+            description="",
+            file_path=Path(""),
+            status=DownloadStatus.FAILED,
+            error_message=error_message
+        )
+        self.download_history.append(content)
+        return content
+
+    def download_multiple(
+        self,
+        urls: List[str],
+        quality: str = "best",
+        extract_audio: bool = False
+    ) -> List[DownloadedContent]:
+        """
+        Download multiple URLs.
+
+        Args:
+            urls: List of URLs to download
+            quality: Video quality
+            extract_audio: Whether to extract audio only
+
+        Returns:
+            List of DownloadedContent objects
+        """
+        results = []
+        for i, url in enumerate(urls):
+            self.logger.info(f"Downloading {i+1}/{len(urls)}: {url}")
+            content = self.download(url, quality=quality, extract_audio=extract_audio)
+            results.append(content)
+        return results
+
+    def get_download_history(self) -> List[DownloadedContent]:
+        """Get download history."""
+        return self.download_history
+
+    def clear_history(self):
+        """Clear download history."""
+        self.download_history.clear()
+
+    def _download_tiktok(self, url: str, download_id: str, custom_title: Optional[str] = None) -> Optional[DownloadedContent]:
+        """
+        Download TikTok video using rapidok.
+
+        Args:
+            url: TikTok video URL
+            download_id: Unique ID for this download
+            custom_title: Optional custom title for the video
+
+        Returns:
+            DownloadedContent object or None on failure
+        """
+        platform = Platform.TIKTOK
+
+        try:
+            # Use rapidok to download
+            result = _download_tiktok_with_rapidok(url, self)
+
+            if not result or not result.exists():
+                error_msg = "rapidok failed to download TikTok video"
+                self.logger.error(error_msg)
+                return self._create_failed_content(download_id, platform, url, error_msg)
+
+            # Get metadata from file info
+            media_file = result
+            file_size = media_file.stat().st_size
+            mime_type = self._get_mime_type(media_file)
+
+            # Extract title from filename or use custom
+            title = media_file.stem
+            if custom_title:
+                title = custom_title
+
+            self.download_history.append(DownloadedContent(
+                id=download_id,
+                platform=platform,
+                original_url=url,
+                title=title,
+                description="",  # No description from rapidok
+                file_path=media_file,
+                file_size=file_size,
+                mime_type=mime_type,
+                metadata={
+                    'platform': platform.value,
+                    'downloaded_by': 'rapidok'
+                }
+            ))
+
+            self.logger.info(f"Downloaded TikTok video successfully: {title}")
+            return self.download_history[-1]
+
+        except Exception as e:
+            error_msg = f"TikTok download error: {str(e)}"
+            self.logger.error(error_msg)
+            return self._create_failed_content(download_id, platform, url, error_msg)
+
+    def _download_instagram(self, url: str, download_id: str, custom_title: Optional[str] = None) -> Optional[DownloadedContent]:
+        """
+        Download Instagram video using instaloader.
+
+        Args:
+            url: Instagram reel/post URL
+            download_id: Unique ID for this download
+            custom_title: Optional custom title for the video
+
+        Returns:
+            DownloadedContent object or None on failure
+        """
+        platform = Platform.INSTAGRAM
+
+        try:
+            # Use instaloader to download
+            result = _download_instagram_with_instaloader(url, self)
+
+            if not result or not result.exists():
+                error_msg = "instaloader failed to download Instagram media"
+                self.logger.error(error_msg)
+                return self._create_failed_content(download_id, platform, url, error_msg)
+
+            # Get metadata from file info
+            media_file = result
+            file_size = media_file.stat().st_size
+            mime_type = self._get_mime_type(media_file)
+
+            # Extract title from filename or use custom
+            title = media_file.stem
+            if custom_title:
+                title = custom_title
+
+            self.download_history.append(DownloadedContent(
+                id=download_id,
+                platform=platform,
+                original_url=url,
+                title=title,
+                description="",  # No description from instaloader
+                file_path=media_file,
+                file_size=file_size,
+                mime_type=mime_type,
+                metadata={
+                    'platform': platform.value,
+                    'downloaded_by': 'instaloader'
+                }
+            ))
+
+            self.logger.info(f"Downloaded Instagram media successfully: {title}")
+            return self.download_history[-1]
+
+        except Exception as e:
+            error_msg = f"Instagram download error: {str(e)}"
+            self.logger.error(error_msg)
+            return self._create_failed_content(download_id, platform, url, error_msg)
+
+    def _download_youtube(self, url: str, download_id: str, quality: str, extract_audio: bool, custom_title: Optional[str] = None) -> Optional[DownloadedContent]:
+        """
+        Download YouTube video using yt-dlp.
+
+        Original implementation preserved for YouTube.
+
+        Args:
+            url: YouTube video URL
+            download_id: Unique ID for this download
+            quality: Video quality preference
+            extract_audio: Whether to extract audio only
+            custom_title: Optional custom title for the video
+
+        Returns:
+            DownloadedContent object or None on failure
+        """
+        platform = Platform.YOUTUBE
+
+        # Check for cookies.txt file if needed
+        if self.use_cookies_file:
             cookies_path = Path(self.cookies_file)
             if not cookies_path.exists():
                 error_msg = f"YouTube download requires cookies.txt file.\n\nPlease create a 'cookies.txt' file in the project directory.\nLocation: {cookies_path.absolute()}\n\nSee COOKIES_GUIDE.md for instructions on how to extract cookies from your browser."
                 self.logger.error(error_msg)
-                return self._create_failed_content(str(uuid.uuid4())[:12], platform, url, error_msg)
+                return self._create_failed_content(download_id, platform, url, error_msg)
 
-        # Generate unique ID for this download
-        download_id = str(uuid.uuid4())[:12]
         output_dir = self.download_folder / download_id
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -164,8 +628,8 @@ class VideoDownloader:
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
-                errors='replace',  # Replace invalid chars instead of crashing
-                timeout=300  # 5 minute timeout
+                errors='replace',
+                timeout=300
             )
 
             if result.returncode != 0:
@@ -255,134 +719,6 @@ class VideoDownloader:
             error_msg = f"Download error: {str(e)}"
             self.logger.error(error_msg)
             return self._create_failed_content(download_id, platform, url, error_msg)
-
-    def _build_command(
-        self,
-        url: str,
-        output_dir: Path,
-        quality: str,
-        extract_audio: bool
-    ) -> List[str]:
-        """Build yt-dlp command."""
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--write-info-json",
-            "--write-thumbnail",
-            "--no-warnings",
-            "-o", str(output_dir / "%(title)s.%(ext)s"),
-        ]
-
-        # Add cookies file for YouTube when enabled to bypass bot detection
-        if self.use_cookies_file and ("youtube.com" in url or "youtu.be" in url or "yt.be" in url):
-            cmd.extend(["--cookies", self.cookies_file])
-            self.logger.info(f"Using cookies file: {self.cookies_file} for YouTube authentication")
-
-        # Quality settings - Robust format selection that works for YouTube Shorts and regular videos
-        # YouTube Shorts require special handling - they have formats but height filters can fail
-        if extract_audio or quality == "audio":
-            cmd.extend([
-                "-x",
-                "--audio-format", "mp3",
-                "--audio-quality", "192K",
-            ])
-            cmd.extend(["-f", "best[height<=1080]/best"])
-        elif quality == "1080p":
-            # For YouTube Shorts, use combined format first (avoids "Requested format is not available")
-            # The format chain tries: 1080p combined -> best up to 1080 -> best overall
-            cmd.extend(["-f", "best[height<=1080]/best[height<=1080]/best"])
-        elif quality == "720p":
-            cmd.extend(["-f", "best[height<=720]/best[height<=720]/best"])
-        elif quality == "480p":
-            cmd.extend(["-f", "best[height<=480]/best[height<=480]/best"])
-        else:
-            # Default: best format - yt-dlp automatically picks the optimal format for each video
-            cmd.extend(["-f", "best"])
-
-        # Platform-specific options
-        if "instagram.com" in url:
-            cmd.extend(["--extractor-args", "instagram:api_version=v1"])
-        elif "tiktok.com" in url:
-            cmd.extend(["--extractor-args", "tiktok:api_version=v1"])
-        elif "youtube.com" in url or "youtu.be" in url or "yt.be" in url:
-            # YouTube-specific options for better compatibility
-            cmd.extend([
-                "--extractor-args", "youtube:player_client=android",
-            ])
-
-        cmd.append(url)
-        return cmd
-
-    def _get_mime_type(self, file_path: Path) -> str:
-        """Get MIME type from file extension."""
-        ext = file_path.suffix.lower()
-        mime_map = {
-            '.mp4': 'video/mp4',
-            '.mov': 'video/quicktime',
-            '.avi': 'video/x-msvideo',
-            '.mkv': 'video/x-matroska',
-            '.webm': 'video/webm',
-            '.mp3': 'audio/mpeg',
-            '.m4a': 'audio/mp4',
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png',
-            '.webp': 'image/webp',
-        }
-        return mime_map.get(ext, 'application/octet-stream')
-
-    def _create_failed_content(
-        self,
-        download_id: str,
-        platform: Platform,
-        url: str,
-        error_message: str
-    ) -> DownloadedContent:
-        """Create a failed download record."""
-        content = DownloadedContent(
-            id=download_id,
-            platform=platform,
-            original_url=url,
-            title="",
-            description="",
-            file_path=Path(""),
-            status=DownloadStatus.FAILED,
-            error_message=error_message
-        )
-        self.download_history.append(content)
-        return content
-
-    def download_multiple(
-        self,
-        urls: List[str],
-        quality: str = "best",
-        extract_audio: bool = False
-    ) -> List[DownloadedContent]:
-        """
-        Download multiple URLs.
-
-        Args:
-            urls: List of URLs to download
-            quality: Video quality
-            extract_audio: Whether to extract audio only
-
-        Returns:
-            List of DownloadedContent objects
-        """
-        results = []
-        for i, url in enumerate(urls):
-            self.logger.info(f"Downloading {i+1}/{len(urls)}: {url}")
-            content = self.download(url, quality=quality, extract_audio=extract_audio)
-            results.append(content)
-        return results
-
-    def get_download_history(self) -> List[DownloadedContent]:
-        """Get download history."""
-        return self.download_history
-
-    def clear_history(self):
-        """Clear download history."""
-        self.download_history.clear()
 
     def cleanup_failed_downloads(self):
         """Remove failed download directories."""

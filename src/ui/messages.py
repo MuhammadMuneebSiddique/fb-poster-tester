@@ -199,6 +199,11 @@ class Messages:
         console.print(f"[error]{ICONS['x']} Download failed: {error_message}[/error]")
 
     @staticmethod
+    def print_wrong_video_error(error_message: str):
+        """Print wrong video error message - downloaded file doesn't match queued video."""
+        console.print(f"[error]{ICONS['x']} {error_message}[/error]")
+
+    @staticmethod
     def print_content_added(content_id: str, title: str):
         """Print message when content is added to manager."""
         safe_title = title.encode('ascii', 'ignore').decode('ascii') if title else "Video"

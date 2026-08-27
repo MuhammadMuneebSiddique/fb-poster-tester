@@ -1,11 +1,15 @@
 """
 Creator Sync Manager
 Handles extracting video links from creator profiles using yt-dlp.
+
+For TikTok and Instagram profiles, this uses dedicated URL discovery modules
+that ONLY discover video URLs. Actual video downloading is handled by yt-dlp.
 """
 
 import os
 import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -20,6 +24,8 @@ from rich.panel import Panel
 from rich.text import Text
 
 from src.ui.console import console, ICONS
+from src.creator.discovery.tiktok_discovery import TikTokDiscovery, TikTokVideoInfo
+from src.creator.discovery.instagram_discovery import InstagramDiscovery, InstagramMediaInfo
 
 
 @dataclass
@@ -32,9 +38,11 @@ class CreatorVideo:
     uploader: str = ""
     duration: Optional[int] = None
     platform: str = ""  # youtube, instagram, tiktok
-    status: str = "pending"  # pending, posted, failed
+    status: str = "pending"  # pending, downloading, downloaded, posted, failed
     posted_at: Optional[str] = None  # ISO timestamp
     content_id: Optional[str] = None  # Generated after download
+    download_attempts: int = 0  # Count of download attempts for retry
+    source_video_id: Optional[str] = None  # Source platform video ID (e.g., TikTok aweme ID)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -49,6 +57,7 @@ class CreatorVideo:
             "status": self.status,
             "posted_at": self.posted_at,
             "content_id": self.content_id,
+            "source_video_id": self.source_video_id,
         }
 
     @classmethod
@@ -65,6 +74,7 @@ class CreatorVideo:
             status=data.get("status", "pending"),
             posted_at=data.get("posted_at"),
             content_id=data.get("content_id"),
+            source_video_id=data.get("source_video_id"),
         )
 
 
@@ -122,13 +132,25 @@ class CreatorSyncManager:
 
     def extract_videos(self, creator_url: str) -> List[CreatorVideo]:
         """
-        Extract all videos from a creator's profile using yt-dlp.
+        Extract all videos from a creator's profile.
+
+        Uses the appropriate method based on platform:
+        - YouTube: yt-dlp extraction (unchanged)
+        - TikTok: TikTokDiscovery module ONLY for URL discovery
+        - Instagram: Instaloader module ONLY for URL discovery
+
+        CRITICAL ARCHITECTURE:
+        - Discovery modules discover video URLs ONLY
+        - URLs are saved to persistent queue
+        - yt-dlp download/posting happens at scheduler time
+        - Creator setup succeeds immediately after discovery
+        - URLs are NOT discarded due to yt-dlp validation failure
 
         Args:
             creator_url: URL of the creator's channel/profile
 
         Returns:
-            List of CreatorVideo objects ordered by upload date (oldest first)
+            List of CreatorVideo objects (pending status, ready for scheduler)
         """
         self.creator_url = creator_url
         self.creator_name = self._extract_creator_name(creator_url)
@@ -141,16 +163,41 @@ class CreatorSyncManager:
         console.print(f"\n[cyan]{ICONS['rocket']} Extracting videos from {self.creator_name}[/cyan]")
         console.print(f"[dim]Platform: {platform}[/dim]")
 
-        # Normalize YouTube URLs to get full video list
+        # Normalize platform-specific URLs
         if platform == "youtube":
             creator_url = self._normalize_youtube_url(creator_url)
             console.print(f"[dim]Normalized URL: {creator_url}[/dim]")
 
-        # Use yt-dlp to extract video information
+        # For TikTok and Instagram, use dedicated discovery modules
+        # These ONLY discover URLs - yt-dlp does the actual download at posting time
+        # URLs are saved to queue immediately; validation happens at scheduler time
+        if platform == "tiktok":
+            creator_url = self._normalize_tiktok_url(creator_url)
+            console.print(f"[dim]TikTok username resolved: {creator_url}[/dim]")
+            videos_added = self._extract_tiktok_via_discovery(creator_url)
+
+            # After discovery, load the queue and return pending videos
+            # The queue is already saved by _extract_tiktok_via_discovery
+            self.videos = self._load_queue()
+            self.logger.info(f"Extracted {len(self.videos)} TikTok videos via discovery")
+            return self.videos
+
+        if platform == "instagram":
+            console.print(f"[dim]Instagram profile URL resolved[/dim]")
+            videos_added = self._extract_instagram_via_discovery(creator_url)
+
+            # After discovery, load the queue and return pending videos
+            self.videos = self._load_queue()
+            self.logger.info(f"Extracted {len(self.videos)} Instagram videos via discovery")
+            return self.videos
+
+        # Use yt-dlp to extract video information (YouTube - unchanged)
         videos = self._extract_with_yt_dlp(creator_url, platform)
 
         # Sort by timestamp (oldest first)
-        videos.sort(key=lambda v: (v.timestamp or 0))
+        # Use a high sentinel value for None timestamps to push them to the end
+        # This ensures videos with unknown timestamps don't appear before known-old videos
+        videos.sort(key=lambda v: (v.timestamp or 0) or 9999999999)
 
         # Update status
         for video in videos:
@@ -227,6 +274,35 @@ class CreatorSyncManager:
 
         return url
 
+    def _normalize_tiktok_url(self, url: str) -> str:
+        """
+        Normalize TikTok URL for consistent extraction.
+
+        TikTok @username URLs are normalized to ensure consistent format.
+        Handles trailing slashes and various TikTok URL formats.
+        """
+        if "tiktok.com" not in url.lower():
+            return url
+
+        # Strip trailing slash for consistency
+        url = url.rstrip("/")
+
+        # Handle @username style URLs - ensure they're in canonical form
+        if "@" in url:
+            # Extract the username and reconstruct
+            import re
+            match = re.search(r'@([a-zA-Z0-9_.]+)', url)
+            if match:
+                username = match.group(1)
+                return f"https://www.tiktok.com/@{username}"
+
+        # Handle videos page URL
+        if "/videos" in url:
+            url = url.replace("/videos", "")
+            return url
+
+        return url
+
     def _extract_with_yt_dlp(self, url: str, platform: str) -> List[CreatorVideo]:
         """Use yt-dlp to extract video information."""
         videos = []
@@ -293,6 +369,225 @@ class CreatorSyncManager:
             console.print(f"[error]{ICONS['x']} Error extracting videos: {e}[/error]")
 
         return videos
+
+    def _extract_tiktok_via_discovery(self, profile_url: str) -> int:
+        """
+        Extract TikTok videos using dedicated discovery library.
+
+        This is the primary TikTok extraction method that:
+        1. Uses TikTokDiscovery to find video URLs
+        2. Saves ALL discovered URLs to the persistent queue
+        3. Creator setup succeeds (does NOT discard URLs due to yt-dlp validation failure)
+        4. Scheduler manages downloading/posting at scheduled times
+
+        Critically: yt-dlp metadata validation happens at posting time, NOT during discovery.
+        Discovered URLs are saved even if yt-dlp cannot immediately extract metadata.
+
+        Args:
+            profile_url: TikTok profile URL (e.g., https://www.tiktok.com/@username)
+
+        Returns:
+            Number of videos added to the queue
+        """
+        videos_added = 0
+
+        # Initialize TikTok discovery
+        discovery = TikTokDiscovery(logger=self.logger)
+
+        # Discover video URLs from the profile
+        console.print(f"[info]{ICONS['info']} Discovering TikTok videos from profile...[/info]")
+        video_infos = discovery.discover_video_urls(profile_url, max_videos=100)
+
+        if not video_infos:
+            console.print(f"[error]{ICONS['x']} No TikTok videos discovered for {self.creator_name}[/error]")
+            console.print(f"[info]{ICONS['info']} The account may be private, empty, or TikTok is blocking extraction[/info]")
+            return 0
+
+        self.logger.info(f"[TIKTOK] Discovered {len(video_infos)} video URLs via discovery library")
+
+        # Step 2: Save ALL discovered URLs to the persistent queue
+        # NO yt-dlp validation during discovery - URLs are saved regardless
+        console.print(f"[cyan]{ICONS['download']} Saving {len(video_infos)} TikTok video URLs to persistent queue...[/cyan]")
+
+        seen_urls = set()
+        new_videos = []
+
+        for i, video_info in enumerate(video_infos, 1):
+            video_url = video_info.url
+
+            # Skip duplicates (by full URL)
+            if video_url in seen_urls or video_url.endswith('/'):
+                continue
+            seen_urls.add(video_url)
+
+            # Extract video ID from URL for deduplication
+            video_id = self._extract_tiktok_video_id(video_url)
+
+            # Create CreatorVideo with pending status
+            video = CreatorVideo(
+                video_url=video_url,
+                title=video_info.title or f"TikTok Video {i}",
+                upload_date=None,
+                timestamp=video_info.upload_timestamp,
+                uploader=video_info.author or self.creator_name or "unknown",
+                duration=video_info.duration,
+                platform="tiktok",
+                status="pending",
+                source_video_id=video_id,
+            )
+
+            new_videos.append(video)
+            self.logger.info(f"[TIKTOK] Saved video {i}/{len(video_infos)}: {video.title[:50]}...")
+
+        if not new_videos:
+            console.print(f"[warning]{ICONS['warning']} No new unique videos to add to queue[/warning]")
+            return 0
+
+        # Add new videos to existing queue (preserving chronological order)
+        # Sort new videos by timestamp (oldest first), then merge with existing
+        all_videos = self.videos + new_videos
+        all_videos.sort(key=lambda v: (v.timestamp or 0) or 9999999999)
+
+        # Deduplicate by video_url, keeping first occurrence (oldest)
+        final_videos = []
+        seen_urls_dedup = set()
+        for video in all_videos:
+            if video.video_url not in seen_urls_dedup:
+                final_videos.append(video)
+                seen_urls_dedup.add(video.video_url)
+
+        self.videos = final_videos
+        videos_added = len(new_videos)
+        self._save_queue()
+
+        console.print(f"[success]{ICONS['check']} Added {videos_added} TikTok videos to posting queue[/success]")
+        console.print(f"[info]{ICONS['info']} Total queue: {len(self.videos)} videos (chronological, oldest first)[/info]")
+
+        # Sort by timestamp (oldest first) for the queue
+        self.videos.sort(key=lambda v: (v.timestamp or 0) or 9999999999)
+
+        return videos_added
+
+    def _extract_tiktok_video_id(self, video_url: str) -> Optional[str]:
+        """Extract TikTok video ID from URL for deduplication."""
+        # Try to extract aweme/video ID from various TikTok URL formats
+        import re
+
+        # Handle: https://www.tiktok.com/@username/video/VIDEO_ID
+        match = re.search(r'/video/([0-9]+)', video_url)
+        if match:
+            return match.group(1)
+
+        # Handle: https://www.tiktok.com/v/VIDEO_ID
+        match = re.search(r'/v/([0-9a-zA-Z]+)', video_url)
+        if match:
+            return match.group(1)
+
+        # Handle: https://www.tiktok.com/@username/video/VISUAL-ID
+        match = re.search(r'video/([^/?&]+)', video_url)
+        if match:
+            return match.group(1)
+
+        # Fallback: use full URL as identifier
+        return video_url.split('?')[0]
+
+    def _extract_instagram_via_discovery(self, profile_url: str) -> int:
+        """
+        Extract Instagram videos using dedicated discovery library.
+
+        This is the primary Instagram extraction method that:
+        1. Uses InstagramDiscovery to find video URLs
+        2. Saves ALL discovered URLs to the persistent queue
+        3. Creator setup succeeds (does NOT discard URLs due to yt-dlp validation failure)
+        4. Scheduler manages downloading/posting at scheduled times
+
+        Critically: yt-dlp metadata validation happens at posting time, NOT during discovery.
+        Discovered URLs are saved even if yt-dlp cannot immediately extract metadata.
+
+        Args:
+            profile_url: Instagram profile URL (e.g., https://www.instagram.com/username/)
+
+        Returns:
+            Number of videos added to the queue
+        """
+        videos_added = 0
+
+        # Initialize Instagram discovery
+        discovery = InstagramDiscovery(logger=self.logger)
+
+        # Discover video URLs from the profile
+        console.print(f"[info]{ICONS['info']} Discovering Instagram videos from profile...[/info]")
+        media_infos = discovery.discover_video_urls(profile_url, max_videos=100)
+
+        if not media_infos:
+            console.print(f"[error]{ICONS['x']} No Instagram videos discovered for {self.creator_name}[/error]")
+            console.print(f"[info]{ICONS['info']} The account may be private, empty, or Instagram is blocking extraction[/info]")
+            return 0
+
+        self.logger.info(f"[INSTAGRAM] Discovered {len(media_infos)} video URLs via discovery library")
+
+        # Step 2: Save ALL discovered URLs to the persistent queue
+        # NO yt-dlp validation during discovery - URLs are saved regardless
+        console.print(f"[cyan]{ICONS['download']} Saving {len(media_infos)} Instagram video URLs to persistent queue...[/cyan]")
+
+        seen_urls = set()
+        new_videos = []
+
+        for i, media_info in enumerate(media_infos, 1):
+            video_url = media_info.url
+
+            # Skip duplicates (by full URL)
+            if video_url in seen_urls or video_url.endswith('/'):
+                continue
+            seen_urls.add(video_url)
+
+            # Extract shortcode from URL for deduplication
+            shortcode = media_info.shortcode
+
+            # Create CreatorVideo with pending status
+            video = CreatorVideo(
+                video_url=video_url,
+                title=media_info.title or f"Instagram Reel {i}",
+                upload_date=None,
+                timestamp=media_info.upload_timestamp,
+                uploader=media_info.author or self.creator_name or "unknown",
+                duration=media_info.duration,
+                platform="instagram",
+                status="pending",
+                source_video_id=shortcode,
+            )
+
+            new_videos.append(video)
+            self.logger.info(f"[INSTAGRAM] Saved video {i}/{len(media_infos)}: {video.title[:50]}...")
+
+        if not new_videos:
+            console.print(f"[warning]{ICONS['warning']} No new unique videos to add to queue[/warning]")
+            return 0
+
+        # Add new videos to existing queue (preserving chronological order)
+        # Sort new videos by timestamp (oldest first), then merge with existing
+        all_videos = self.videos + new_videos
+        all_videos.sort(key=lambda v: (v.timestamp or 0) or 9999999999)
+
+        # Deduplicate by video_url, keeping first occurrence (oldest)
+        final_videos = []
+        seen_urls_dedup = set()
+        for video in all_videos:
+            if video.video_url not in seen_urls_dedup:
+                final_videos.append(video)
+                seen_urls_dedup.add(video.video_url)
+
+        self.videos = final_videos
+        videos_added = len(new_videos)
+        self._save_queue()
+
+        console.print(f"[success]{ICONS['check']} Added {videos_added} Instagram videos to posting queue[/success]")
+        console.print(f"[info]{ICONS['info']} Total queue: {len(self.videos)} videos (chronological, oldest first)[/info]")
+
+        # Sort by timestamp (oldest first) for the queue
+        self.videos.sort(key=lambda v: (v.timestamp or 0) or 9999999999)
+
+        return videos_added
 
     def _create_video_from_flat_info(self, data: Dict[str, Any]) -> Optional[CreatorVideo]:
         """Create CreatorVideo from flat playlist entry (limited info)."""
@@ -425,6 +720,10 @@ class CreatorSyncManager:
         This method is called daily to check for new uploads and add them
         to the existing queue without duplicating already-queued or posted videos.
 
+        CRITICAL: Uses discovery modules (TikTok/Instagram) which ONLY discover URLs.
+        yt-dlp validation happens at posting time, NOT during re-sync.
+        New URLs are added to the persistent queue regardless of immediate yt-dlp validation.
+
         Args:
             existing_urls: Set of video URLs already in the queue
 
@@ -437,30 +736,45 @@ class CreatorSyncManager:
 
         console.print(f"\n[cyan]{ICONS['rocket']} Re-syncing {self.creator_name} for new videos...[/cyan]")
 
-        # Extract all videos from creator (with higher limit for re-sync)
-        all_videos = self._extract_with_yt_dlp(self.creator_url, self.detect_platform(self.creator_url))
+        # Extract all videos from creator using discovery modules only
+        # These modules ONLY discover URLs - yt-dlp handles download at posting time
+        platform = self.detect_platform(self.creator_url)
+        if platform == "tiktok":
+            creator_url = self._normalize_tiktok_url(self.creator_url)
+            videos_added = self._extract_tiktok_via_discovery(creator_url)
+        elif platform == "instagram":
+            videos_added = self._extract_instagram_via_discovery(self.creator_url)
+        else:
+            # YouTube - use existing yt-dlp method
+            all_videos = self._extract_with_yt_dlp(self.creator_url, platform)
+            # For YouTube, convert to video count
+            videos_added = len(all_videos) if all_videos else 0
 
-        if not all_videos:
+        if not videos_added and platform not in ("youtube",):
             console.print(f"[info]{ICONS['info']} No videos found during re-sync[/info]")
             return 0
 
-        # Sort by timestamp (oldest first)
-        all_videos.sort(key=lambda v: (v.timestamp or 0) or 9999999999)
+        # For YouTube, we have actual video objects; for TikTok/Instagram, count is from discovery
+        if platform == "youtube" and videos_added == 0:
+            console.print(f"[info]{ICONS['info']} No videos found during re-sync[/info]")
+            return 0
 
-        # Filter to only new videos
+        # Filter to only new videos (not already in existing_urls)
         new_videos = []
-        for video in all_videos:
-            if video.video_url not in existing_urls:
+        for video in self.videos:
+            # Only include videos that are pending and not already in existing URLs
+            # We need to check against the full queue state after re-sync
+            if video.status == "pending" and video.video_url not in existing_urls:
+                # Re-determine platform
                 video.platform = self.detect_platform(video.video_url)
                 video.status = "pending"
                 new_videos.append(video)
                 self.logger.info(f"New video found: {video.title}")
 
         if new_videos:
-            # Append to existing queue
-            self.videos.extend(new_videos)
+            # Append to existing queue (they're already there from discovery, just re-mark)
             self._save_queue()
-            console.print(f"[success]{ICONS['check']} Added {len(new_videos)} new videos from {self.creator_name}[/success]")
+            console.print(f"[success]{ICONS['check']} Added {len(new_videos)} new/remaining videos from {self.creator_name}[/success]")
         else:
             console.print(f"[info]{ICONS['info']} No new videos found during re-sync[/info]")
 
@@ -502,6 +816,7 @@ class CreatorSyncManager:
             "pending_count": sum(1 for v in self.videos if v.status == "pending"),
             "posted_count": sum(1 for v in self.videos if v.status == "posted"),
             "failed_count": sum(1 for v in self.videos if v.status == "failed"),
+            "downloading_count": sum(1 for v in self.videos if v.status == "downloading"),
         }
 
         with open(self.queue_file, 'w', encoding='utf-8') as f:
@@ -519,6 +834,17 @@ class CreatorSyncManager:
         video.status = "posted"
         video.posted_at = datetime.now().isoformat()
         video.content_id = content_id
+        self._save_queue()
+
+    def mark_as_downloading(self, video: CreatorVideo):
+        """Mark a video as currently being downloaded."""
+        video.status = "downloading"
+        video.download_attempts += 1
+        self._save_queue()
+
+    def mark_as_downloaded(self, video: CreatorVideo):
+        """Mark a video as successfully downloaded."""
+        video.status = "downloaded"
         self._save_queue()
 
     def mark_as_failed(self, video: CreatorVideo, error: str = ""):

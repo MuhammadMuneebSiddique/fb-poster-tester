@@ -1702,6 +1702,18 @@ class FacebookAutoPoster:
 
             Messages.print_download_complete(content.title, str(content.file_path))
 
+            # Validate that the downloaded file matches the queued video ID
+            import re
+            queued_video_id = item.video_url.split('/video/')[-1].split('?')[0] if '/video/' in item.video_url else None
+            downloaded_video_id = content.file_path.stem if content.file_path else None
+
+            if queued_video_id and downloaded_video_id and queued_video_id != downloaded_video_id:
+                Messages.print_wrong_video_error(
+                    f"Video ID mismatch: queue has '{queued_video_id}' but downloaded file has '{downloaded_video_id}'"
+                )
+                self._handle_download_failure(item)
+                return
+
             # Add to content manager
             content_type = ContentType.VIDEO if content.mime_type.startswith('video/') else ContentType.IMAGE
 
