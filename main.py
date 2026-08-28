@@ -40,6 +40,9 @@ from rich.columns import Columns
 from rich.style import Style
 import random
 
+# Import session management classes
+from src.creator.session import SessionManager, SessionVideo, VideoStatus, CreatorSession, SessionStatus
+
 
 # ============================================
 # Hashtag Utility for Facebook Reels
@@ -409,16 +412,26 @@ class FacebookAutoPoster:
                 "Run first-time setup to configure credentials."
             )
 
+        # Get page_name from config if available (will be overwritten by API if empty)
+        page_name = ""
+        try:
+            page_info = config_mgr.get_page_by_id(page_id)
+            if page_info:
+                page_name = page_info.get('page_name', '')
+        except:
+            pass
+
         console.print(f"[info]{ICONS['cog']} Initializing Facebook client for Page ID: {page_id}[/info]")
         self.facebook_client = FacebookClient(
             page_id=page_id,
             access_token=access_token,
+            page_name=page_name,
             api_version="v21.0",
             timeout=120,
             logger=self.logger
         )
 
-        # Test connection
+        # Test connection (this will fetch and store the actual page_name from API)
         if not self.facebook_client.test_connection():
             raise ConnectionError("Failed to connect to Facebook Graph API")
 
@@ -464,6 +477,7 @@ class FacebookAutoPoster:
             self.facebook_client = FacebookClient(
                 page_id=page_id,
                 access_token=access_token,
+                page_name=page_name,
                 api_version="v21.0",
                 timeout=120,
                 logger=self.logger
@@ -596,6 +610,13 @@ class FacebookAutoPoster:
             config_mgr = get_config_manager()
             if config_mgr.save_credentials(token, page_id, app_id, app_secret, cookies_file):
                 SetupPrompts.show_setup_success(page_id)
+                # Reload config to ensure in-memory state matches disk
+                config_mgr.reload()
+                page_count = config_mgr.get_page_count()
+                self.logger.info(f"✓ Configuration saved successfully")
+                self.logger.info(f"✓ Configuration reloaded")
+                self.logger.info(f"✓ Detected {page_count} configured page(s)")
+                self.logger.info(f"✓ First-run setup completed")
                 return True
             else:
                 SetupPrompts.show_setup_error("Failed to save credentials")
@@ -1058,6 +1079,14 @@ class FacebookAutoPoster:
                 else:
                     console.print("[dim]App Secret not changed (left blank).[/dim]")
 
+            # Reload config after any individual credential update
+            if updated and choice in ("1", "2", "3", "4"):
+                config_mgr.reload()
+                page_count = config_mgr.get_page_count()
+                self.logger.info(f"✓ Configuration saved successfully")
+                self.logger.info(f"✓ Configuration reloaded")
+                self.logger.info(f"✓ Detected {page_count} configured page(s)")
+
             # Update All Credentials (fresh setup)
             elif choice == "5":
                 console.print(f"[header]{ICONS['key']} Enter New Credentials[/header]")
@@ -1101,6 +1130,15 @@ class FacebookAutoPoster:
                 # Invalidate cached Facebook client so it gets recreated with new credentials
                 self.facebook_client = None
                 self.facebook_poster = None
+
+                # Reload config for choice 5 (Update All) and 6 (Cookies)
+                # Choices 1-4 already reloaded above
+                if choice in ("5", "6"):
+                    config_mgr.reload()
+                    page_count = config_mgr.get_page_count()
+                    self.logger.info(f"✓ Configuration saved successfully")
+                    self.logger.info(f"✓ Configuration reloaded")
+                    self.logger.info(f"✓ Detected {page_count} configured page(s)")
 
                 # Refresh the display
                 console.print()
@@ -1162,185 +1200,16 @@ class FacebookAutoPoster:
                 config_mgr.set_cookies_file(cookies_file)
                 SetupPrompts.show_setup_success(page_id, page_name)
                 self.set_active_page(0)
+                # Reload config to ensure in-memory state matches disk
+                config_mgr.reload()
+                page_count = config_mgr.get_page_count()
+                self.logger.info(f"✓ Configuration saved successfully")
+                self.logger.info(f"✓ Configuration reloaded")
+                self.logger.info(f"✓ Detected {page_count} configured page(s)")
             else:
                 SetupPrompts.show_setup_error("Failed to save credentials")
         else:
             console.print("[yellow]Setup cancelled.[/yellow]")
-
-    def run_add_page(self):
-        """Add a new page to the configuration."""
-        console.print()
-        console.print(Rule(style="cyan"))
-        console.print(f"[header]{ICONS['key']} ADD NEW PAGE[/header]")
-        console.print(Rule(style="cyan"))
-        console.print()
-
-        config_mgr = get_config_manager()
-        page_count = config_mgr.get_page_count()
-        max_pages = ConfigManager.MAX_PAGES
-
-        if page_count >= max_pages:
-            console.print(f"[warning]{ICONS['warning']} Maximum of {max_pages} pages reached![/warning]")
-            console.print("[dim]Please update an existing page or contact support for more pages.[/dim]")
-            return
-
-        console.print(f"[dim]You have {page_count}/{max_pages - 1} page slots available.[/dim]")
-        console.print()
-
-        # Get credentials
-        token, page_id, app_id, app_secret = SetupPrompts.request_credentials(include_optional=True)
-
-        # Get page name
-        console.print()
-        page_name = Prompt.ask(
-            "[cyan]Page Name (optional - for easy identification)[/cyan]",
-            default=""
-        )
-        page_name = page_name.strip() if page_name.strip() else None
-
-        # Confirm
-        masked_token = mask_token(token)
-        console.print()
-        console.print(f"[header]{ICONS['key']} Add Page Summary[/header]")
-        console.print()
-        console.print(f"  [cyan]Page ID:[/cyan] {page_id}")
-        console.print(f"  [cyan]Page Name:[/cyan] {page_name or 'Not set'}")
-        console.print(f"  [cyan]Access Token:[/cyan] {masked_token}")
-        console.print()
-
-        if Confirm.ask("[cyan]Add this page?[/cyan]", default=True):
-            if config_mgr.add_page(token, page_id, page_name, app_id):
-                if app_secret:
-                    config_mgr.set_app_secret(app_secret)
-                console.print(f"[success]{ICONS['check']} Page added successfully![/success]")
-                console.print(f"[dim]Added as page {page_count + 1} of {max_pages}[/dim]")
-            else:
-                console.print(f"[error]{ICONS['x']} Failed to add page.[/error]")
-        else:
-            console.print("[dim]Page not added.[/dim]")
-
-    def run_update_page(self):
-        """Update credentials for an existing page."""
-        console.print()
-        console.print(Rule(style="cyan"))
-        console.print(f"[header]{ICONS['key']} UPDATE PAGE CREDENTIALS[/header]")
-        console.print(Rule(style="cyan"))
-        console.print()
-
-        config_mgr = get_config_manager()
-        pages = config_mgr.get_pages()
-
-        if not pages:
-            console.print("[warning]{ICONS['warning']} No pages found.[/warning]")
-            return
-
-        # Show pages
-        SetupPrompts.show_pages_list(pages)
-
-        # Select page to update
-        console.print("  0. Cancel")
-        for i, page in enumerate(pages):
-            page_name = page.get('page_name', '') or f"Page {i + 1}"
-            console.print(f"  {i + 1}. Update {page_name}")
-
-        console.print()
-
-        choice = Prompt.ask(
-            "[cyan]Select page to update (0 to cancel)[/cyan]",
-            choices=[str(i) for i in range(len(pages) + 1)],
-            default="0"
-        )
-
-        choice_num = int(choice)
-        if choice_num == 0:
-            console.print("[dim]Cancelled.[/dim]")
-            return
-
-        page_index = choice_num - 1
-        page = pages[page_index]
-
-        console.print()
-        console.print(f"[header]{ICONS['edit']} Update: {page.get('page_name') or f'Page {page_index + 1}'}[/header]")
-        console.print()
-
-        # Get new token
-        token = SetupPrompts.ask_page_access_token()
-
-        # Get new page ID
-        new_page_id = SetupPrompts.ask_page_id()
-
-        # Get page name
-        new_name = Prompt.ask(
-            "[cyan]Page Name (press Enter to keep current)[/cyan]",
-            default=page.get('page_name', '')
-        )
-        new_name = new_name.strip() if new_name.strip() else page.get('page_name', '')
-
-        # Confirm
-        if SetupPrompts.confirm_setup(token, new_page_id, new_name):
-            if config_mgr.update_page(page_index, token, new_page_id, new_name):
-                console.print(f"[success]{ICONS['check']} Page updated successfully![/success]")
-                # Invalidate cached client if we updated the currently active page
-                if self._active_page_index == page_index:
-                    self.facebook_client = None
-                    self.facebook_poster = None
-            else:
-                console.print(f"[error]{ICONS['x']} Failed to update page.[/error]")
-
-    def run_delete_page(self):
-        """Delete a page from the configuration."""
-        console.print()
-        console.print(Rule(style="cyan"))
-        console.print(f"[header]{ICONS['x']} DELETE PAGE[/header]")
-        console.print(Rule(style="cyan"))
-        console.print()
-
-        config_mgr = get_config_manager()
-        pages = config_mgr.get_pages()
-
-        # Can't delete if only one page
-        if len(pages) <= 1:
-            console.print("[warning]{ICONS['warning']} Cannot delete the last page. Use 'Update Credentials' to modify it instead.[/warning]")
-            return
-
-        # Show pages
-        SetupPrompts.show_pages_list(pages)
-
-        # Select page to delete
-        console.print("  0. Cancel")
-        for i, page in enumerate(pages):
-            page_name = page.get('page_name', '') or f"Page {i + 1}"
-            console.print(f"  {i + 1}. Delete {page_name}")
-
-        console.print()
-
-        choice = Prompt.ask(
-            "[cyan]Select page to delete (0 to cancel)[/cyan]",
-            choices=[str(i) for i in range(len(pages) + 1)],
-            default="0"
-        )
-
-        choice_num = int(choice)
-        if choice_num == 0:
-            console.print("[dim]Cancelled.[/dim]")
-            return
-
-        page_index = choice_num - 1
-        page = pages[page_index]
-        page_name = page.get('page_name', '') or f"Page {page_index + 1}"
-
-        console.print()
-        console.print(f"[warning]Are you sure you want to delete '{page_name}'? This cannot be undone.[/warning]")
-
-        if Confirm.ask("[cyan]Delete this page?[/cyan]", default=False):
-            if config_mgr.remove_page(page_index):
-                # Update active page index if needed
-                if self._active_page_index >= len(pages) - 1:
-                    self._active_page_index = max(0, self._active_page_index - 1)
-
-                console.print(f"[success]{ICONS['check']} Page deleted successfully![/success]")
-            else:
-                console.print(f"[error]{ICONS['x']} Failed to delete page.[/error]")
 
     def reset_creator_queue(self):
         """Reset the creator queue - all videos become pending."""
@@ -1379,6 +1248,14 @@ class FacebookAutoPoster:
                 t = PromptUI.ask_time(i + 1, num_times)
                 scheduled_times.append(t.strftime('%H:%M'))
 
+        # Set creator mode flag before setup (disables queue saves)
+        self._is_creator_mode = True
+
+        # Get page_id and page_name for session management
+        page_id, page_name = self._get_current_page_info()
+        if page_id:
+            self._setup_session_with_page(page_id, page_name)
+
         # Sync the creator
         new_count = self.creator_sync_manager.sync_creator(creator_url)
 
@@ -1389,15 +1266,23 @@ class FacebookAutoPoster:
         # Get all videos sorted by date (oldest first)
         all_videos = self.creator_sync_manager.list_videos()
 
+        # Get session info for page-scoped queue items
+        session_id = self.creator_sync_manager.current_session.session_id if self.creator_sync_manager.current_session else None
+        page_id = self.creator_sync_manager.page_id
+
         # Add to posting queue distributed across scheduled times
         added_items = self.posting_queue.add_multiple_videos(
             videos=[{
                 'video_url': v.video_url,
                 'title': v.title,
                 'upload_date': v.upload_date,
-                'timestamp': v.timestamp
+                'timestamp': v.timestamp,
+                'source_video_id': v.source_video_id,
+                'platform': v.platform
             } for v in all_videos if v.status == "pending" or v.status not in ["posted", "failed"]],
-            scheduled_times=scheduled_times
+            scheduled_times=scheduled_times,
+            session_id=session_id,
+            page_id=page_id
         )
 
         console.print(f"[success]{ICONS['check']} Added {len(added_items)} videos to posting queue[/success]")
@@ -1454,6 +1339,14 @@ class FacebookAutoPoster:
 
         console.print(f"\n[info]{ICONS['info']} Times configured: {', '.join(scheduled_times)} PKT[/info]")
 
+        # Set creator mode flag before setup (disables queue saves)
+        self._is_creator_mode = True
+
+        # Get page_id and page_name for session management
+        page_id, page_name = self._get_current_page_info()
+        if page_id:
+            self._setup_session_with_page(page_id, page_name)
+
         # Step 1: Sync creator and extract videos
         console.print()
         console.print(f"[cyan]{ICONS['calendar']} Step 1: Syncing videos from creator...[/cyan]")
@@ -1469,14 +1362,23 @@ class FacebookAutoPoster:
         console.print(f"[cyan]{ICONS['calendar']} Step 2: Adding videos to posting queue...[/cyan]")
 
         all_videos = self.creator_sync_manager.list_videos()
+
+        # Get session info for page-scoped queue items
+        session_id = self.creator_sync_manager.current_session.session_id if self.creator_sync_manager.current_session else None
+        page_id = self.creator_sync_manager.page_id
+
         added_items = self.posting_queue.add_multiple_videos(
             videos=[{
                 'video_url': v.video_url,
                 'title': v.title,
                 'upload_date': v.upload_date,
-                'timestamp': v.timestamp
+                'timestamp': v.timestamp,
+                'source_video_id': v.source_video_id,
+                'platform': v.platform
             } for v in all_videos],
-            scheduled_times=scheduled_times
+            scheduled_times=scheduled_times,
+            session_id=session_id,
+            page_id=page_id
         )
 
         console.print(f"[success]{ICONS['check']} Added {len(added_items)} videos to posting queue[/success]")
@@ -1542,11 +1444,45 @@ class FacebookAutoPoster:
         console.print(Rule(style="cyan"))
         console.print()
 
+        # Set creator mode flag before setup (disables queue saves)
+        self._is_creator_mode = True
+
+        # Get page_id and page_name for session management
+        page_id, page_name = self._get_current_page_info()
+        if page_id:
+            self._setup_session_with_page(page_id, page_name)
+
         console.print(f"[info]{ICONS['info']} Times configured: {', '.join(scheduled_times)} PKT[/info]")
 
         # Step 1: Sync creator and extract videos
         console.print()
         console.print(f"[cyan]{ICONS['calendar']} Syncing videos from creator...[/cyan]")
+
+        # Get platform
+        platform = self.creator_sync_manager.detect_platform(creator_url)
+
+        # Set creator info in the manager (needed for session creation)
+        self.creator_sync_manager.creator_url = creator_url
+        self.creator_sync_manager.creator_name = self.creator_sync_manager._extract_creator_name(creator_url)
+
+        # Check if we have an existing session or need to create a new one
+        session = None
+        if self.creator_sync_manager.current_session:
+            # Existing session - reuse it
+            session = self.creator_sync_manager.current_session
+            self.logger.info(f"[SESSION] Reusing existing session {session.session_id}")
+        else:
+            # Create new session for the platform
+            session = self.creator_sync_manager.create_session(platform)
+
+        if not session:
+            console.print(f"[error]{ICONS['x']} Failed to create session[/error]")
+            return False
+
+        # CRITICAL: Set current_session BEFORE sync_creator so videos are synced properly
+        if not self.creator_sync_manager.current_session:
+            self.creator_sync_manager.current_session = session
+            self.logger.info(f"[SESSION] Set current_session before sync: {session.session_id}")
 
         new_count = self.creator_sync_manager.sync_creator(creator_url)
 
@@ -1554,20 +1490,78 @@ class FacebookAutoPoster:
             console.print(f"[warning]{ICONS['warning']} No videos found for {self.creator_sync_manager.creator_name}[/warning]")
             return False
 
+        # Ensure all videos are synced to session (sync_creator should have done this via _sync_videos_to_session)
+        # If videos weren't synced (e.g., no existing session), sync them now
+        if session.videos:
+            # Videos already in session - that's correct
+            pass
+        else:
+            # Video list is empty - build it from in-memory videos
+            session.videos = []
+            session.queue_order = []
+
+            for cv in self.creator_sync_manager.videos:
+                # Generate video_id using platform + source_video_id
+                video_id = self.creator_sync_manager.session_manager.generate_video_id(
+                    cv.platform, cv.source_video_id
+                )
+
+                from src.creator.session import SessionVideo, VideoStatus as SessionVideoStatus
+                sv = SessionVideo(
+                    video_id=video_id,
+                    video_url=cv.video_url,
+                    title=cv.title,
+                    session_id=session.session_id,
+                    upload_date=cv.upload_date,
+                    timestamp=cv.timestamp,
+                    platform=cv.platform,
+                    status=SessionVideoStatus.PENDING,
+                    content_id=None,
+                    posted_at=None,
+                    download_attempts=cv.download_attempts,
+                    retry_count=0,
+                    error_message="",
+                    source_video_id=cv.source_video_id,
+                    scheduled_time=None,
+                )
+                session.videos.append(sv)
+                session.queue_order.append(video_id)
+
+        # Update session metadata
+        session.status = SessionStatus.ACTIVE
+        session.total_videos = len(session.videos)
+        session.posting_schedule = scheduled_times
+        session.creator_url = self.creator_sync_manager.creator_url or self._creator_url or ""
+
+        # Save session to disk
+        self.creator_sync_manager.session_manager.save_session(session)
+        self.logger.info(f"[SESSION] Saved session with {session.total_videos} videos")
+        self.logger.info(f"[SESSION] Saved posting_schedule: {scheduled_times}")
+        self.logger.info(f"[SESSION] Saved creator_url: {session.creator_url[:50] if session.creator_url else 'None'}...")
+
         # Step 2: Add videos to posting queue
         console.print()
         console.print(f"[cyan]{ICONS['calendar']} Adding videos to posting queue...[/cyan]")
 
+        # Add videos with page-scoped queue items
         all_videos = self.creator_sync_manager.list_videos()
-        added_items = self.posting_queue.add_multiple_videos(
-            videos=[{
-                'video_url': v.video_url,
-                'title': v.title,
-                'upload_date': v.upload_date,
-                'timestamp': v.timestamp
-            } for v in all_videos],
-            scheduled_times=scheduled_times
-        )
+        session_id = session.session_id if session else None
+        added_items = []
+        for i, v in enumerate(all_videos):
+            time_idx = i % len(scheduled_times)
+            scheduled_time = scheduled_times[time_idx]
+            item = self.posting_queue.add_video(
+                video_url=v.video_url,
+                title=v.title,
+                upload_date=v.upload_date,
+                timestamp=v.timestamp,
+                scheduled_time=scheduled_time,
+                page_id=page_id,
+                session_id=session_id,
+                source_video_id=v.source_video_id,
+                platform=v.platform
+            )
+            added_items.append(item)
 
         console.print(f"[success]{ICONS['check']} Added {len(added_items)} videos to posting queue[/success]")
 
@@ -1682,6 +1676,17 @@ class FacebookAutoPoster:
             # Mark as downloading
             self.posting_queue.mark_as_downloading(item.id)
 
+            # Update session status - mark as processing for crash recovery
+            if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                    item.source_video_id or "", item.platform or ""
+                )
+                if session_video:
+                    session_video.status = VideoStatus.PROCESSING
+                    self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                    self.logger.info(f"[SESSION] Video {session_video.video_id} marked PROCESSING")
+                    self.logger.info(f"[SESSION] Saving session: {self.creator_sync_manager.current_session.total_videos} total, {len(self.creator_sync_manager.current_session.posted_videos)} posted, {self.creator_sync_manager.current_session.get_pending_count()} pending")
+
             # Download video
             console.print(f"\n[cyan]{ICONS['download']} Downloading video...[/cyan]")
             self.logger.info(f"Downloading video for creator job: {item.video_url}")
@@ -1759,19 +1764,57 @@ class FacebookAutoPoster:
                 # Mark as posted
                 self.posting_queue.mark_as_posted(item.id, content_item.id)
 
+                # Update session status for page-scoped persistence
+                if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                    # Find video by source_video_id and update its status
+                    self.creator_sync_manager.session_manager.mark_video_posted_by_source(
+                        item.source_video_id or "",
+                        content_id=content_item.id,
+                        platform=item.platform or ""
+                    )
+                    self.logger.info(f"[SESSION] Updated video status to POSTED in session for {item.title}")
+
                 self.logger.info(f"Successfully posted: {item.title}")
                 Messages.print_post_success(content.title)
 
                 # Show queue status
                 self._show_queue_status()
             else:
+                # Handle post failure
                 self._handle_post_failure(item, "Failed to post to Facebook")
+
+                # Update session status for page-scoped persistence
+                if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                    self.creator_sync_manager.session_manager.mark_video_failed_by_source(
+                        item.source_video_id or "",
+                        error_message="Failed to post to Facebook",
+                        platform=item.platform or ""
+                    )
+                    self.logger.info(f"[SESSION] Updated video status to FAILED in session for {item.title}")
 
         except Exception as e:
             self.logger.error(f"Job {job_id} execution error: {e}", exc_info=True)
             console.print(f"[error]{ICONS['x']} ERROR: {e}[/error]")
             if 'item' in dir() and item and hasattr(item, 'retry_count'):
                 self._handle_post_failure(item, str(e))
+
+                # Update session status for page-scoped persistence
+                if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                    if item.retry_count < 3:
+                        # Reset to pending for retry using proper method
+                        self.creator_sync_manager.session_manager.mark_video_pending_by_url(
+                            item.video_url,
+                            platform=item.platform or ""
+                        )
+                        self.logger.info(f"[SESSION] Reset video to PENDING for retry: {item.title}")
+                    else:
+                        # Mark as failed
+                        self.creator_sync_manager.session_manager.mark_video_failed_by_source(
+                            item.source_video_id or "",
+                            error_message=str(e),
+                            platform=item.platform or ""
+                        )
+                        self.logger.info(f"[SESSION] Updated video status to FAILED in session for {item.title}")
             else:
                 # Item might be None or invalid, log and continue
                 self.logger.warning(f"Could not update queue for failed job {job_id}")
@@ -1781,20 +1824,36 @@ class FacebookAutoPoster:
         self.posting_queue.mark_as_failed(item.id, "Download failed")
         self._show_queue_status()
 
+        # Update session status for page-scoped persistence
+        if self.creator_sync_manager and self.creator_sync_manager.current_session:
+            self.creator_sync_manager.session_manager.mark_video_failed_by_source(
+                item.source_video_id or "",
+                error_message="Download failed",
+                platform=item.platform or ""
+            )
+            self.logger.info(f"[SESSION] Updated video status to FAILED in session for {item.title}")
+
     def _handle_post_failure(self, item: 'QueueItem', error: str = ""):
         """Handle a failed post with retry logic."""
         item.retry_count += 1
 
         if item.retry_count < 3:
             item.status = "pending"  # Will retry
-            self.posting_queue._save()
+            # Only save if queue saves are enabled (creator mode disables queue saves)
+            if self.posting_queue._should_save():
+                self.posting_queue._save()
             console.print(f"[warning]{ICONS['warning']} Retry #{item.retry_count} scheduled[/warning]")
         else:
             item.status = "failed"
-            self.posting_queue._save()
+            # Only save if queue saves are enabled (creator mode disables queue saves)
+            if self.posting_queue._should_save():
+                self.posting_queue._save()
             console.print(f"[error]{ICONS['x']} Max retries reached. Marking as failed.[/error]")
 
         self._show_queue_status()
+
+        # Update session status for page-scoped persistence (already done in _execute_creator_job else branch)
+        # This is called from download failure which happens before the try block's success/failure handling
 
     def _schedule_daily_resync(self, _creator_url: str = None):
         """
@@ -1820,6 +1879,8 @@ class FacebookAutoPoster:
                 if all_times:
                     # Add new videos with time distribution
                     new_video_list = self.creator_sync_manager.list_videos()
+                    session_id = self.creator_sync_manager.current_session.session_id if self.creator_sync_manager.current_session else None
+                    page_id = self.creator_sync_manager.page_id
                     for i, video in enumerate(new_video_list):
                         if video.video_url not in existing_urls:
                             time_idx = i % len(all_times)
@@ -1830,7 +1891,11 @@ class FacebookAutoPoster:
                                 title=video.title,
                                 upload_date=video.upload_date,
                                 timestamp=video.timestamp,
-                                scheduled_time=scheduled_time
+                                scheduled_time=scheduled_time,
+                                page_id=page_id,
+                                session_id=session_id,
+                                source_video_id=video.source_video_id,
+                                platform=video.platform
                             )
 
                     self.logger.info(f"Added {len(new_videos)} new videos from daily re-sync")
@@ -2192,6 +2257,581 @@ class FacebookAutoPoster:
 
         return status
 
+    # ============================================
+    # Session Persistence Methods
+    # ============================================
+
+    def _get_current_page_id(self) -> Optional[str]:
+        """Get the current active page ID from Facebook client."""
+        if self.facebook_client:
+            return self.facebook_client.page_id
+        return None
+
+    def _get_current_page_info(self) -> Tuple[Optional[str], str]:
+        """
+        Get the current active page ID and name from Facebook client/config.
+
+        Returns:
+            Tuple of (page_id, page_name) - page_name may be empty string if not available
+        """
+        page_id = self._get_current_page_id()
+        page_name = ""
+
+        if page_id:
+            # Try to get page_name from Facebook client first
+            if self.facebook_client and hasattr(self.facebook_client, 'page_name') and self.facebook_client.page_name:
+                page_name = self.facebook_client.page_name
+            else:
+                # Fall back to config manager
+                config_mgr = get_config_manager()
+                page_info = config_mgr.get_page_by_id(page_id)
+                if page_info:
+                    page_name = page_info.get('page_name', '')
+
+        return page_id, page_name
+
+    def check_incomplete_session(self, page_id: Optional[str] = None) -> bool:
+        """
+        Check if there's an incomplete session that needs recovery.
+
+        Args:
+            page_id: Page ID to check. Uses current page if not provided.
+
+        Returns:
+            True if there's an incomplete session, False otherwise
+        """
+        if not page_id:
+            page_id = self._get_current_page_id()
+        if not page_id:
+            return False
+
+        if self.creator_sync_manager and self.creator_sync_manager.session_manager:
+            return self.creator_sync_manager.session_manager.has_incomplete_session()
+        return False
+
+    def _prompt_session_recovery(self, page_id: str) -> str:
+        """
+        Prompt user to recover or reset an incomplete session.
+
+        Returns:
+            "continue_same" - Continue with same schedule
+            "continue_change" - Continue with new schedule
+            "reset" - Start fresh (clear session and begin new)
+            "back" - Go back to page selection
+        """
+        if not self.creator_sync_manager or not self.creator_sync_manager.current_session:
+            return "continue_same"
+
+        session = self.creator_sync_manager.current_session
+
+        console.print()
+        console.print(Rule(style="yellow"))
+        console.print(f"[header]{ICONS['warning']} INCOMPLETE SESSION DETECTED[/header]")
+        console.print(Rule(style="yellow"))
+        console.print()
+
+        console.print(f"[dim]Page ID: {page_id}[/dim]")
+        console.print(f"[dim]Creator: {session.creator_name}[/dim]")
+        console.print(f"[dim]Platform: {session.platform}[/dim]")
+        console.print(f"[dim]Total Videos: {len(session.videos)}[/dim]")
+        console.print(f"[dim]Posted: {session.get_posted_count()}, Pending: {session.get_pending_count()}[/dim]")
+        console.print()
+
+        # Show current schedule if available
+        if session.posting_schedule:
+            console.print(f"[cyan]Current schedule: {', '.join(session.posting_schedule)} PKT[/cyan]")
+            console.print()
+
+        console.print("[cyan]What would you like to do?[/cyan]")
+        console.print()
+        console.print("  1. Continue previous posting session")
+        console.print("  2. Start fresh (clear session and begin new)")
+        console.print("  3. Back")
+        console.print()
+
+        choice = Prompt.ask(
+            "[cyan]Enter your choice (1-3):[/cyan]",
+            choices=["1", "2", "3"],
+            default="1"
+        )
+
+        if choice == "1":
+            # Ask about schedule
+            return self._prompt_schedule_choice(session.posting_schedule)
+        elif choice == "2":
+            return "reset"
+        else:
+            return "back"
+
+    def _prompt_schedule_choice(self, current_schedule: List[str]) -> str:
+        """
+        Prompt user to keep or change the posting schedule.
+
+        Args:
+            current_schedule: The current posting schedule from the session
+
+        Returns:
+            "continue_same" - Keep the existing schedule
+            "continue_change" - Change to a new schedule
+        """
+        console.print()
+        console.print(Rule(style="cyan"))
+        console.print(f"[header]{ICONS['clock']} POSTING SCHEDULE[/header]")
+        console.print(Rule(style="cyan"))
+        console.print()
+
+        if current_schedule:
+            console.print(f"[cyan]Previous schedule:[/cyan]")
+            for i, t in enumerate(current_schedule, 1):
+                console.print(f"  {i}. {t} PKT")
+            console.print()
+
+        console.print("[cyan]What would you like to do?[/cyan]")
+        console.print()
+        console.print("  1. Keep the same schedule")
+        console.print("  2. Change posting schedule")
+        console.print("  3. Back")
+        console.print()
+
+        choice = Prompt.ask(
+            "[cyan]Enter your choice (1-3):[/cyan]",
+            choices=["1", "2", "3"],
+            default="1"
+        )
+
+        if choice == "1":
+            return "continue_same"
+        elif choice == "2":
+            return "continue_change"
+        else:
+            return "back"
+
+    def _prompt_new_schedule(self, session: 'CreatorSession') -> List[str]:
+        """
+        Prompt user for a new posting schedule and update the session.
+
+        Args:
+            session: The current session to update
+
+        Returns:
+            List of new scheduled times, or empty list if cancelled
+        """
+        from datetime import time as dt_time
+        from rich.prompt import IntPrompt
+
+        console.print()
+        console.print(Rule(style="cyan"))
+        console.print(f"[header]{ICONS['clock']} NEW POSTING SCHEDULE[/header]")
+        console.print(Rule(style="cyan"))
+        console.print()
+
+        console.print(f"[dim]Current schedule: {', '.join(session.posting_schedule)} PKT[/dim]")
+        console.print(f"[dim]Enter new times below[/dim]")
+        console.print()
+
+        # Ask for number of posts (0 to cancel)
+        while True:
+            try:
+                num_times = IntPrompt.ask(
+                    f"[cyan]How many posts do you want to schedule?[/cyan]",
+                    default=len(session.posting_schedule),
+                    show_default=True
+                )
+                if num_times == 0:
+                    console.print(f"[warning]{ICONS['warning']} Cancelled[/warning]")
+                    return []
+                if num_times < 1:
+                    console.print(f"[warning]{ICONS['warning']} Number of posts must be at least 1[/warning]")
+                    continue
+                if num_times > 100:
+                    console.print(f"[warning]{ICONS['warning']} Maximum 100 posts allowed[/warning]")
+                    continue
+                break
+            except Exception:
+                console.print(f"[error]{ICONS['x']} Invalid number. Please enter a positive integer.[/error]")
+                continue
+
+        new_times = []
+        for i in range(num_times):
+            while True:
+                try:
+                    time_input = Prompt.ask(
+                        f"[cyan]Enter time {i+1} (HH:MM, 24-hour format, Pakistan Time)[/cyan]",
+                        default="09:00"
+                    )
+                    scheduled_time = dt_time.fromisoformat(time_input)
+                    new_times.append(time_input)
+                    break
+                except ValueError:
+                    console.print(f"[warning]{ICONS['warning']} Invalid time format. Use HH:MM (24-hour format)[/warning]")
+
+        # Update session with new schedule
+        session.posting_schedule = new_times
+        session.last_update_time = dt_datetime.now().isoformat()
+
+        # Save session immediately
+        self.creator_sync_manager.session_manager.save_session(session)
+
+        console.print()
+        console.print(f"[success]{ICONS['check']} Schedule updated to: {', '.join(new_times)} PKT[/success]")
+        self.logger.info(f"[SESSION] Updated posting schedule to: {new_times}")
+
+        return new_times
+
+    def run_continue_posting_with_new_schedule(self, page_id: str) -> bool:
+        """
+        Continue a previous posting session with a new schedule.
+
+        This calls run_continue_posting with keep_schedule=False to prompt
+        for a new schedule before continuing.
+
+        Args:
+            page_id: The Facebook Page ID
+
+        Returns:
+            True if session was found and recovered, False otherwise
+        """
+        return self.run_continue_posting(page_id, keep_schedule=False)
+
+    def _prompt_reset_session(self, page_id: str) -> bool:
+        """
+        Prompt user to confirm session reset.
+
+        Returns:
+            True if user confirms reset, False otherwise
+        """
+        console.print()
+        console.print(f"[warning]{ICONS['warning']} This will clear all progress for Page {page_id}[/warning]")
+        console.print("[dim]All posted/failed statistics will be lost.[/dim]")
+        console.print()
+
+        choice = Confirm.ask("[yellow]Are you sure you want to reset this session?[/yellow]", default=False)
+        return choice
+
+    def reset_session(self, page_id: str) -> bool:
+        """
+        Reset (clear) the session for a specific page.
+
+        This creates a fresh start, losing all posted statistics.
+        Use when starting a completely new profile sync.
+
+        Args:
+            page_id: The Facebook Page ID
+
+        Returns:
+            True if reset successful
+        """
+        if self.creator_sync_manager:
+            # Reset the session status but keep the queue
+            if self.creator_sync_manager.current_session:
+                self.creator_sync_manager.current_session.status = SessionStatus.SETUP
+                self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+            console.print(f"[success]{ICONS['check']} Session reset for Page {page_id}[/success]")
+            return True
+        return False
+
+    def run_continue_posting(self, page_id: str, keep_schedule: bool = True):
+        """
+        Continue a previous posting session from where it crashed.
+
+        This:
+        1. Loads the incomplete session
+        2. Shows resume progress
+        3. Restores pending videos to queue
+        4. Restores scheduled times (either keeps existing or uses new schedule)
+        5. Recreates scheduler jobs
+        6. Starts the scheduler
+        7. Keeps program running for posting
+        8. Maintains page isolation
+
+        Args:
+            page_id: The Facebook Page ID
+            keep_schedule: If True, keep existing schedule. If False, prompt for new schedule.
+
+        Returns:
+            True if session was found and recovered, False otherwise
+        """
+        if not self.creator_sync_manager or not self.creator_sync_manager.current_session:
+            console.print(f"[warning]{ICONS['warning']} No session to continue[/warning]")
+            return False
+
+        session = self.creator_sync_manager.current_session
+        page_id = session.page_id  # Get page_id from session
+
+        # Disable queue saves - session file is the single source of truth during creator mode
+        if self.posting_queue:
+            self.posting_queue.page_id = page_id  # Set page_id for page-scoped filtering
+            self.posting_queue.disable_save()
+            self.logger.info(f"[RESUME] Disabled queue saves - session is source of truth")
+        if self.creator_sync_manager:
+            self.creator_sync_manager.disable_save()
+            self.creator_sync_manager.page_id = page_id  # Ensure page_id is set
+            self.logger.info(f"[RESUME] Disabled creator queue saves - session is source of truth")
+
+        # Update status to active
+        session.status = SessionStatus.ACTIVE
+        self.creator_sync_manager.session_manager.save_session(session)
+
+        # Show resume information
+        console.print()
+        console.print(Rule(style="green"))
+        console.print(f"[header]{ICONS['rocket']} RESUMING POSTING SESSION[/header]")
+        console.print(Rule(style="green"))
+        console.print()
+
+        console.print(f"[cyan]{ICONS['page']} Page: {self.facebook_client.page_name}[/cyan]")
+        console.print(f"[cyan]{ICONS['rocket']} Creator: {session.creator_name}[/cyan]")
+
+        stats = {
+            "total": len(session.videos),
+            "posted": session.get_posted_count(),
+            "pending": session.get_pending_count(),
+            "failed": session.get_failed_count(),
+            "processing": session.get_processing_count()
+        }
+
+        console.print()
+        console.print(Panel(
+            Text.assemble(
+                (f"Session Progress:\n", "cyan"),
+                (f"Total Videos: {stats['total']}\n", "green"),
+                (f"Posted: {stats['posted']}  ", "green"),
+                (f"Pending: {stats['pending']}  ", "yellow"),
+                (f"Failed: {stats['failed']}  ", "red"),
+                (f"Processing (crash): {stats['processing']}", "magenta"),
+            ),
+            border_style="green",
+            expand=False
+        ))
+
+        # Get posting schedule (needed for queue distribution and job creation)
+        scheduled_times = session.posting_schedule
+        if not scheduled_times:
+            console.print(f"[error]{ICONS['x']} No posting schedule found in session[/error]")
+            self.logger.warning("[RESUME] No posting schedule - cannot restore queue")
+            return False
+
+        # If keep_schedule is False, prompt for new schedule
+        if not keep_schedule:
+            scheduled_times = self._prompt_new_schedule(session)
+            if not scheduled_times:
+                return False
+
+        # Recovery: Handle corrupted session where videos are missing
+        # This can happen if session file was partially written or from a bug
+        if session.total_videos > 0 and len(session.videos) == 0:
+            console.print(f"[warning]{ICONS['warning']} Session has {session.total_videos} total videos but videos list is empty - recovering from posting queue[/warning]")
+            self.logger.info(f"[RESUME] Recovering videos from posting queue for {session.total_videos} videos")
+
+            # Load all items from posting queue (not just pending - include all statuses)
+            from src.creator.session import VideoStatus as SessionVideoStatus
+            queue_items = [item for item in self.posting_queue.items if item.video_id in session.queue_order or not session.queue_order]
+
+            for item in queue_items:
+                if item.source_video_id:
+                    video_id = self.creator_sync_manager.session_manager.generate_video_id(
+                        item.platform or "youtube", item.source_video_id
+                    )
+
+                    from src.creator.session import SessionVideo
+                    sv = SessionVideo(
+                        video_id=video_id,
+                        video_url=item.video_url,
+                        title=item.title,
+                        session_id=session.session_id,
+                        upload_date=item.upload_date,
+                        timestamp=item.timestamp,
+                        platform=item.platform or "youtube",
+                        status=SessionVideoStatus.PENDING,  # Will be recalculated based on item status
+                        content_id=None,
+                        posted_at=item.posted_at,
+                        download_attempts=item.retry_count,
+                        retry_count=item.retry_count,
+                        error_message="",
+                        source_video_id=item.source_video_id,
+                        scheduled_time=item.scheduled_time,
+                    )
+
+                    # Map item status to session video status
+                    if item.status == "posted":
+                        sv.status = SessionVideoStatus.POSTED
+                    elif item.status == "failed" or item.status == "downloading":
+                        sv.status = SessionVideoStatus.FAILED
+
+                    session.videos.append(sv)
+                    if video_id not in session.queue_order:
+                        session.queue_order.append(video_id)
+
+                    # Update posted/failed tracking
+                    if item.status == "posted":
+                        if video_id not in session.posted_videos:
+                            session.posted_videos.append(video_id)
+                    elif item.status == "failed" or item.status == "downloading":
+                        if video_id not in session.failed_videos:
+                            session.failed_videos.append(video_id)
+
+            session.total_videos = len(session.videos)
+            self.logger.info(f"[RESUME] Recovered {len(session.videos)} videos from posting queue")
+            self.creator_sync_manager.session_manager.save_session(session)
+
+        # Recover from crash state
+        # 1. Mark PROCESSING videos as PENDING for retry
+        # 2. Mark FAILED videos with retry_count < 3 as PENDING for retry
+        if stats['processing'] > 0 or stats['failed'] > 0:
+            if stats['processing'] > 0:
+                console.print(f"[warning]{ICONS['warning']} Found videos in PROCESSING state - recovering from crash[/warning]")
+                self.logger.info(f"[RESUME] Recovering {stats['processing']} videos from PROCESSING state")
+                for video in session.videos:
+                    if video.status == VideoStatus.PROCESSING:
+                        video.status = VideoStatus.PENDING
+                        video.error_message = ""
+                        video.download_attempts = 0
+                        self.logger.info(f"[RESUME] Reset processing video to pending: {video.title}")
+
+            # Also recover FAILED videos that haven't exceeded retry limit
+            failed_videos = [v for v in session.videos if v.status == VideoStatus.FAILED and v.retry_count < 3]
+            if failed_videos:
+                self.logger.info(f"[RESUME] Recovering {len(failed_videos)} FAILED videos that need retry (retry_count < 3)")
+                for video in failed_videos:
+                    video.status = VideoStatus.PENDING
+                    video.error_message = ""
+                    video.download_attempts = 0
+                    self.logger.info(f"[RESUME] Reset failed video to pending for retry: {video.title}")
+
+            # Sort videos by queue order
+            session.videos.sort(key=lambda v: session.queue_order.index(v.video_id) if v.video_id in session.queue_order else len(session.queue_order))
+
+            # Update failed_videos list in session
+            session.failed_videos = [v.video_id for v in session.videos if v.status == VideoStatus.FAILED]
+
+            # Save the recovered session
+            self.creator_sync_manager.session_manager.save_session(session)
+
+        # Restore pending videos to the posting queue
+        # In creator mode, the queue is page-scoped, so clearing is safe
+        # This ensures correct scheduled times from posting_schedule
+        self.logger.info(f"[RESUME] Clearing queue for page {page_id} to rebuild with correct schedule")
+        console.print(f"[info]{ICONS['info']} Rebuilding posting queue with correct schedule...[/info]")
+        self.posting_queue.clear(reset_order=True)
+
+        pending_videos = [v for v in session.videos if v.status == VideoStatus.PENDING]
+        restored_count = 0
+        if pending_videos:
+            self.logger.info(f"[RESUME] Restoring {len(pending_videos)} pending videos to queue")
+            console.print(f"[info]{ICONS['info']} Restoring {len(pending_videos)} pending videos...[/info]")
+
+            # Distribute videos across scheduled times (oldest first by queue_order)
+            num_times = len(scheduled_times)
+            for i, video in enumerate(pending_videos):
+                time_idx = i % num_times
+                scheduled_time = scheduled_times[time_idx]
+
+                self.posting_queue.add_video(
+                    video_url=video.video_url,
+                    title=video.title,
+                    upload_date=video.upload_date,
+                    timestamp=video.timestamp,
+                    scheduled_time=scheduled_time,
+                    page_id=page_id,
+                    session_id=session.session_id,
+                    source_video_id=video.source_video_id,
+                    platform=video.platform
+                )
+                restored_count += 1
+
+        console.print(f"[success]{ICONS['check']} Restored {restored_count} videos to posting queue[/success]")
+
+        # Restore creator_url for daily re-sync
+        if session.creator_url:
+            self._creator_url = session.creator_url
+            self.logger.info(f"[RESUME] Restored creator_url for daily re-sync")
+        else:
+            self.logger.warning("[RESUME] No creator_url in session - daily re-sync may not work")
+
+        # Recreate scheduled jobs
+        self.logger.info(f"[RESUME] Restoring schedule: {scheduled_times}")
+        console.print(f"[info]{ICONS['info']} Posting schedule: {', '.join(scheduled_times)} PKT daily[/info]")
+
+        console.print(f"[cyan]{ICONS['calendar']} Recreating scheduler jobs...[/cyan]")
+        self._create_creator_jobs(scheduled_times)
+        self._schedule_daily_resync(self._creator_url)
+        self.logger.info(f"[RESUME] Recreated scheduler jobs for times: {scheduled_times}")
+
+        console.print()
+        console.print(f"[success]{ICONS['check']} Scheduler jobs recreated successfully[/success]")
+
+        # Start the scheduler
+        console.print(f"[cyan]{ICONS['cog']} Starting scheduler...[/cyan]")
+        self.scheduler_manager.start()
+        self._is_creator_mode = True
+
+        console.print()
+        console.print(f"[green]{ICONS['check']} Scheduler started! Pending videos will be posted at configured times.[/green]")
+        console.print(f"[info]{ICONS['info']} The program will continue running until all videos are posted.[/info]")
+        console.print(f"[info]{ICONS['info']} Press Ctrl+C to stop at any time.[/info]")
+        console.print()
+
+        # Enter the main loop to keep the program running
+        self.running = True
+        self.state = AppState.RUNNING
+
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.logger.info("Keyboard interrupt received - stopping.")
+            self.stop()
+
+        return True
+
+    def _setup_session_with_page(self, page_id: str, page_name: str = ""):
+        """
+        Setup creator sync manager with page-scoped session and queue.
+
+        This initializes the session manager and loads any existing incomplete
+        session for the given page, enabling crash recovery.
+
+        Args:
+            page_id: The Facebook Page ID to associate with the session
+            page_name: The Facebook Page name for display purposes
+        """
+        if self.creator_sync_manager:
+            self.creator_sync_manager.page_id = page_id
+            self.creator_sync_manager.session_manager = SessionManager(page_id=page_id)
+
+            # Check for and load any incomplete session for crash recovery
+            if self.creator_sync_manager.session_manager.has_incomplete_session():
+                self.creator_sync_manager.current_session = \
+                    self.creator_sync_manager.session_manager.get_incomplete_session()
+                # Sync session videos to in-memory queue for continued operations
+                self.creator_sync_manager.sync_session_to_memory()
+                self.logger.info(f"[SESSION] Loaded incomplete session for page {page_id} with {len(self.creator_sync_manager.current_session.videos)} videos")
+            else:
+                self.logger.info(f"[SESSION] No incomplete session found for page {page_id}")
+
+            # Populate page_name in current session if available
+            if self.creator_sync_manager.current_session:
+                if page_name:
+                    self.creator_sync_manager.current_session.page_name = page_name
+                elif not self.creator_sync_manager.current_session.page_name:
+                    # Try to get page_name from config
+                    config_mgr = get_config_manager()
+                    page_info = config_mgr.get_page_by_id(page_id)
+                    if page_info:
+                        self.creator_sync_manager.current_session.page_name = page_info.get('page_name', '')
+
+        if self.posting_queue:
+            self.posting_queue.page_id = page_id
+            # Disable queue file saves during creator mode - session file is the source of truth
+            if self._is_creator_mode:
+                self.posting_queue.disable_save()
+                self.logger.info(f"[SESSION] Disabled queue saves for page {page_id} - session is source of truth")
+
+        # Also disable creator queue file saves during creator mode
+        if self.creator_sync_manager and self._is_creator_mode:
+            self.creator_sync_manager.disable_save()
+            self.logger.info(f"[SESSION] Disabled creator queue saves for page {page_id} - session is source of truth")
+
 
 # ============================================
 # Helper functions for page selection flow
@@ -2307,42 +2947,58 @@ def _run_page_management_loop():
                 if not app.initialize(skip_schedule=True):
                     console.print(f"[error]{ICONS['x']} Failed to initialize application[/error]")
                     sys.exit(1)
+                # Set creator mode flag for session-based posting
+                app._is_creator_mode = True
                 # Initialize Facebook client for the selected page
                 if app._initialize_facebook_client_for_page(selected_index):
-                    # Successfully initialized - go to main feature menu
-                    _run_main_menu_loop(app)
+                    # Get the page_id and page_name for session setup
+                    page_id, page_name = app._get_current_page_info()
+                    if page_id:
+                        # Setup session manager for the selected page
+                        app._setup_session_with_page(page_id, page_name)
+                    # Check for incomplete session for recovery
+                    if page_id and app.check_incomplete_session(page_id):
+                        # Show recovery dialog
+                        recovery_choice = app._prompt_session_recovery(page_id)
+                        if recovery_choice == "continue_same":
+                            # User wants to continue previous session with same schedule
+                            if app.run_continue_posting(page_id, keep_schedule=True):
+                                _run_main_menu_loop(app)
+                        elif recovery_choice == "continue_change":
+                            # User wants to change the posting schedule
+                            if app.run_continue_posting_with_new_schedule(page_id):
+                                _run_main_menu_loop(app)
+                        elif recovery_choice == "reset":
+                            # User chose to start fresh
+                            if app._prompt_reset_session(page_id):
+                                app.reset_session(page_id)
+                                _run_main_menu_loop(app)
+                        elif recovery_choice == "back":
+                            # User wants to go back - just loop to show page menu again
+                            pass
+                    elif page_id:
+                        # Successfully initialized - go to main feature menu
+                        _run_main_menu_loop(app)
                 # If initialization failed, loop back to page management menu
 
         elif choice == "2":
-            # Add new page - but only if under limit
+            # Add new page - lightweight operation, no full app init needed
             if page_count >= ConfigManager.MAX_PAGES:
                 console.print(f"[warning]{ICONS['warning']} Maximum of {ConfigManager.MAX_PAGES} pages reached![/warning]")
                 console.print("[dim]Contact support for additional pages.[/dim]")
                 continue
 
-            app = FacebookAutoPoster()
-            if not app.initialize(skip_schedule=True):
-                console.print(f"[error]{ICONS['x']} Failed to initialize application[/error]")
-                sys.exit(1)
-            app.run_add_page()
+            _run_add_page_lightweight()
             # Loop back to show updated page list
 
         elif choice == "3" and page_count > 1:
-            # Update existing page
-            app = FacebookAutoPoster()
-            if not app.initialize(skip_schedule=True):
-                console.print(f"[error]{ICONS['x']} Failed to initialize application[/error]")
-                sys.exit(1)
-            app.run_update_page()
+            # Update existing page - lightweight operation, no full app init needed
+            _run_update_page_lightweight()
             # Loop back to show updated page list
 
         elif choice == "4" and page_count > 1:
-            # Delete a page
-            app = FacebookAutoPoster()
-            if not app.initialize(skip_schedule=True):
-                console.print(f"[error]{ICONS['x']} Failed to initialize application[/error]")
-                sys.exit(1)
-            app.run_delete_page()
+            # Delete a page - lightweight operation, no full app init needed
+            _run_delete_page_lightweight()
 
             # Check if no pages left after deletion
             config_mgr = get_config_manager()
@@ -2390,6 +3046,223 @@ def _run_main_menu_loop(app: 'FacebookAutoPoster'):
             app.run_one_day_posting()
             # One-day posting runs continuously until Ctrl+C, stays in loop
             continue
+
+
+# ============================================
+# Lightweight Page Management Functions (no full app init)
+# These functions only use ConfigManager, avoiding unnecessary initialization
+
+
+def _run_add_page_lightweight():
+    """
+    Add a new page - lightweight operation using only ConfigManager.
+
+    Does NOT initialize ContentManager, yt-dlp, Scheduler, or other heavy components.
+    Only requires access to ConfigManager for page credential storage.
+    """
+    console.print()
+    console.print(Rule(style="cyan"))
+    console.print(f"[header]{ICONS['key']} ADD NEW PAGE[/header]")
+    console.print(Rule(style="cyan"))
+    console.print()
+
+    config_mgr = get_config_manager()
+    page_count = config_mgr.get_page_count()
+    max_pages = ConfigManager.MAX_PAGES
+
+    if page_count >= max_pages:
+        console.print(f"[warning]{ICONS['warning']} Maximum of {max_pages} pages reached![/warning]")
+        console.print("[dim]Please update an existing page or contact support for more pages.[/dim]")
+        return
+
+    console.print(f"[dim]You have {page_count}/{max_pages - 1} page slots available.[/dim]")
+    console.print()
+
+    # Get credentials
+    token, page_id, app_id, app_secret = SetupPrompts.request_credentials(include_optional=True)
+
+    # Get page name
+    console.print()
+    page_name = Prompt.ask(
+        "[cyan]Page Name (optional - for easy identification)[/cyan]",
+        default=""
+    )
+    page_name = page_name.strip() if page_name.strip() else None
+
+    # Confirm
+    masked_token = mask_token(token)
+    console.print()
+    console.print(f"[header]{ICONS['key']} Add Page Summary[/header]")
+    console.print()
+    console.print(f"  [cyan]Page ID:[/cyan] {page_id}")
+    console.print(f"  [cyan]Page Name:[/cyan] {page_name or 'Not set'}")
+    console.print(f"  [cyan]Access Token:[/cyan] {masked_token}")
+    console.print()
+
+    if Confirm.ask("[cyan]Add this page?[/cyan]", default=True):
+        if config_mgr.add_page(token, page_id, page_name, app_id):
+            if app_secret:
+                config_mgr.set_app_secret(app_secret)
+            config_mgr.reload()
+            page_count = config_mgr.get_page_count()
+            console.print(f"[success]{ICONS['check']} Page added successfully![/success]")
+            console.print(f"[dim]Added as page {page_count} of {max_pages}[/dim]")
+            logger = logging.getLogger(__name__)
+            logger.info(f"✓ Configuration saved successfully")
+            logger.info(f"✓ Configuration reloaded")
+            logger.info(f"✓ Detected {page_count} configured page(s)")
+        else:
+            console.print(f"[error]{ICONS['x']} Failed to add page.[/error]")
+    else:
+        console.print("[dim]Page not added.[/dim]")
+
+
+def _run_update_page_lightweight():
+    """
+    Update credentials for an existing page - lightweight operation using only ConfigManager.
+
+    Does NOT initialize ContentManager, yt-dlp, Scheduler, or other heavy components.
+    Only requires access to ConfigManager for page credential storage.
+    """
+    console.print()
+    console.print(Rule(style="cyan"))
+    console.print(f"[header]{ICONS['key']} UPDATE PAGE CREDENTIALS[/header]")
+    console.print(Rule(style="cyan"))
+    console.print()
+
+    config_mgr = get_config_manager()
+    pages = config_mgr.get_pages()
+
+    if not pages:
+        console.print(f"[warning]{ICONS['warning']} No pages found.[/warning]")
+        return
+
+    # Show pages
+    SetupPrompts.show_pages_list(pages)
+
+    # Select page to update
+    console.print("  0. Cancel")
+    for i, page in enumerate(pages):
+        page_name = page.get('page_name', '') or f"Page {i + 1}"
+        console.print(f"  {i + 1}. Update {page_name}")
+
+    console.print()
+
+    choice = Prompt.ask(
+        "[cyan]Select page to update (0 to cancel)[/cyan]",
+        choices=[str(i) for i in range(len(pages) + 1)],
+        default="0"
+    )
+
+    choice_num = int(choice)
+    if choice_num == 0:
+        console.print("[dim]Cancelled.[/dim]")
+        return
+
+    page_index = choice_num - 1
+    page = pages[page_index]
+
+    console.print()
+    console.print(f"[header]{ICONS['edit']} Update: {page.get('page_name') or f'Page {page_index + 1}'}[/header]")
+    console.print()
+
+    # Get new token
+    token = SetupPrompts.ask_page_access_token()
+
+    # Get new page ID
+    new_page_id = SetupPrompts.ask_page_id()
+
+    # Get page name
+    new_name = Prompt.ask(
+        "[cyan]Page Name (press Enter to keep current)[/cyan]",
+        default=page.get('page_name', '')
+    )
+    new_name = new_name.strip() if new_name.strip() else page.get('page_name', '')
+
+    # Confirm
+    if SetupPrompts.confirm_setup(token, new_page_id, new_name):
+        if config_mgr.update_page(page_index, token, new_page_id, new_name):
+            config_mgr.reload()
+            page_count = config_mgr.get_page_count()
+            logger = logging.getLogger(__name__)
+            logger.info(f"✓ Configuration saved successfully")
+            logger.info(f"✓ Configuration reloaded")
+            logger.info(f"✓ Detected {page_count} configured page(s)")
+            console.print(f"[success]{ICONS['check']} Page updated successfully![/success]")
+
+
+def _run_delete_page_lightweight():
+    """
+    Delete a page - lightweight operation using only ConfigManager.
+
+    Does NOT initialize ContentManager, yt-dlp, Scheduler, or other heavy components.
+    Only requires access to ConfigManager for page credential storage.
+    Also clears any session files for the deleted page.
+    """
+    console.print()
+    console.print(Rule(style="cyan"))
+    console.print(f"[header]{ICONS['x']} DELETE PAGE[/header]")
+    console.print(Rule(style="cyan"))
+    console.print()
+
+    config_mgr = get_config_manager()
+    pages = config_mgr.get_pages()
+
+    # Can't delete if only one page
+    if len(pages) <= 1:
+        console.print("[warning]{ICONS['warning']} Cannot delete the last page. Use 'Update Credentials' to modify it instead.[/warning]")
+        return
+
+    # Show pages
+    SetupPrompts.show_pages_list(pages)
+
+    # Select page to delete
+    console.print("  0. Cancel")
+    for i, page in enumerate(pages):
+        page_name = page.get('page_name', '') or f"Page {i + 1}"
+        console.print(f"  {i + 1}. Delete {page_name}")
+
+    console.print()
+
+    choice = Prompt.ask(
+        "[cyan]Select page to delete (0 to cancel)[/cyan]",
+        choices=[str(i) for i in range(len(pages) + 1)],
+        default="0"
+    )
+
+    choice_num = int(choice)
+    if choice_num == 0:
+        console.print("[dim]Cancelled.[/dim]")
+        return
+
+    page_index = choice_num - 1
+    page = pages[page_index]
+    page_name = page.get('page_name', '') or f"Page {page_index + 1}"
+
+    # Get the page_id for session file cleanup
+    page_id = page.get('page_id', '')
+
+    console.print()
+    console.print(f"[warning]Are you sure you want to delete '{page_name}'? This cannot be undone.[/warning]")
+
+    if Confirm.ask("[cyan]Delete this page?[/cyan]", default=False):
+        if config_mgr.remove_page(page_index):
+            # Clear session file for this page
+            if page_id:
+                from src.creator.session import SessionManager, clear_session
+                clear_session(page_id)
+                console.print(f"[dim]Cleared session file for page {page_id}[/dim]")
+
+            config_mgr.reload()
+            page_count = config_mgr.get_page_count()
+            logger = logging.getLogger(__name__)
+            logger.info(f"✓ Configuration saved successfully")
+            logger.info(f"✓ Configuration reloaded")
+            logger.info(f"✓ Detected {page_count} configured page(s)")
+
+            console.print(f"[success]{ICONS['check']} Page deleted successfully![/success]")
+        else:
+            console.print(f"[error]{ICONS['x']} Failed to delete page.[/error]")
 
 
 # ============================================
@@ -2511,9 +3384,14 @@ Examples:
                 sys.exit(1)
             app.run_first_time_setup()
 
-            # Refresh page count after setup to check if page was added
-            config_mgr = get_config_manager()
+            # Reload configuration from disk to pick up newly saved page
+            config_mgr.reload()
             page_count = config_mgr.get_page_count()
+            pages = config_mgr.get_pages()
+            app.logger.info(f"✓ Configuration saved successfully")
+            app.logger.info(f"✓ Configuration reloaded")
+            app.logger.info(f"✓ Detected {page_count} configured page(s)")
+            app.logger.info(f"✓ First-run setup completed")
 
             # If setup was cancelled (still no pages), exit gracefully
             if page_count == 0:

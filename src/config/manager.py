@@ -350,18 +350,34 @@ class ConfigManager:
 
     def update_credential(self, field: str, value: str, page_index: int = 0) -> bool:
         """
-        Update a specific field for a page.
+        Update a specific field for a page or global config.
 
         Args:
-            field: Field to update (page_access_token, page_id)
+            field: Field to update (page_access_token, page_id, app_id, app_secret, cookies_file)
             value: New value
             page_index: Page index (default 0)
 
         Returns:
             True if updated successfully
         """
-        return self.update_page(page_index, page_access_token=value if field == 'page_access_token' else None,
-                                  page_id=value if field == 'page_id' else None)
+        if not self._loaded:
+            self._load()
+
+        # Handle page-specific fields
+        if field in ('page_access_token', 'page_id', 'app_id'):
+            return self.update_page(page_index,
+                                    page_access_token=value if field == 'page_access_token' else None,
+                                    page_id=value if field == 'page_id' else None,
+                                    app_id=value if field == 'app_id' else None)
+
+        # Handle global config fields
+        if field == 'app_secret':
+            return self.set_app_secret(value)
+
+        if field == 'cookies_file':
+            return self.set_cookies_file(value)
+
+        return False
 
     def remove_page(self, page_index: int) -> bool:
         """
@@ -525,6 +541,19 @@ class ConfigManager:
         if not self._loaded:
             self._load()
         return self._config.copy()
+
+    def reload(self) -> bool:
+        """
+        Force reload configuration from disk.
+
+        Use this after external changes to config.json or after
+        saving credentials to ensure in-memory state matches file.
+
+        Returns:
+            True if reload successful
+        """
+        self._loaded = False
+        return self._load()
 
     def migrate_from_env(self) -> bool:
         """

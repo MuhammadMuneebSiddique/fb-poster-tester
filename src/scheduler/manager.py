@@ -29,8 +29,11 @@ class ScheduledJob:
     id: str
     content_id: str
     scheduled_time: dt_time
+    page_id: Optional[str] = None  # Page-scoped for multi-page isolation
+    video_url: Optional[str] = None  # Page-scoped video URL for verification
     days: List[str] = field(default_factory=lambda: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
     enabled: bool = True
+    status: str = "scheduled"  # scheduled, running, completed, failed
     last_run: Optional[datetime] = None
     next_run: Optional[datetime] = None
 
@@ -251,6 +254,14 @@ class SchedulerManager:
 
         job = self.jobs[job_id]
 
+        # CRITICAL: Verify page_id matches expected page for this scheduler instance
+        # This prevents cross-page posting errors
+        if self.content_manager.page_id and job.page_id and job.page_id != self.content_manager.page_id:
+            self.logger.error(f"Page ID mismatch for job {job_id}: expected {self.content_manager.page_id}, got {job.page_id}")
+            console.print(f"[error]{ICONS['x']} Page ID mismatch - job belongs to different page[/error]")
+            job.status = "failed"
+            return
+
         if not job.enabled:
             self.logger.info(f"Job {job_id} is disabled, skipping")
             console.print(f"[cyan]{ICONS['cog']}[/cyan] Job {job_id} is disabled, skipping")
@@ -262,6 +273,9 @@ class SchedulerManager:
             console.print(f"[cyan]{ICONS['cog']}[/cyan] Job {job_id} has no content assigned, skipping")
             return
 
+        # Mark job as running
+        job.status = "running"
+
         # Get content info for display
         content = self.content_manager.get_content(job.content_id)
         content_title = content.title if content else "Unknown"
@@ -269,6 +283,8 @@ class SchedulerManager:
         self.logger.info(f"Executing scheduled job: {job_id} (content: {job.content_id})")
         console.print(f"[cyan]{ICONS['rocket']} Starting post for: {content_title}[/cyan]")
         console.print(f"[cyan]{ICONS['link']} Content ID: {job.content_id}[/cyan]")
+        if job.page_id:
+            console.print(f"[cyan]{ICONS['page']} Page ID: {job.page_id}[/cyan]")
         console.print(f"[cyan]{ICONS['clock']} Scheduled time: {job.scheduled_time.strftime('%H:%M')} PKT[/cyan]")
 
         try:
@@ -285,13 +301,16 @@ class SchedulerManager:
                 job.next_run = next_run
 
             if success:
+                job.status = "completed"
                 self.logger.info(f"Job {job_id} completed successfully")
                 console.print(f"[success]{ICONS['check']} SUCCESS: {content_title} posted to Facebook![/success]")
             else:
+                job.status = "failed"
                 self.logger.error(f"Job {job_id} failed to post content")
                 console.print(f"[error]{ICONS['x']} FAILED: {content_title} - Check logs for details[/error]")
 
         except Exception as e:
+            job.status = "failed"
             self.logger.error(f"Job {job_id} execution error: {e}", exc_info=True)
             console.print(f"[error]{ICONS['x']} ERROR: {job_id} - {e}[/error]")
 
@@ -374,12 +393,16 @@ class SchedulerManager:
             "running": self.scheduler.running,
             "timezone": str(self.timezone),
             "jobs_count": len(self.jobs),
+            "page_id": getattr(self.content_manager, 'page_id', None) if self.content_manager else None,
             "jobs": [
                 {
                     "id": job.id,
                     "content_id": job.content_id,
+                    "page_id": job.page_id,
+                    "video_url": job.video_url,
                     "time": job.scheduled_time.strftime("%H:%M"),
                     "days": job.days,
+                    "status": job.status,
                     "enabled": job.enabled,
                     "last_run": job.last_run.isoformat() if job.last_run else None,
                     "next_run": job.next_run.isoformat() if job.next_run else None

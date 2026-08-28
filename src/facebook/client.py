@@ -24,6 +24,7 @@ class FacebookClient:
         self,
         page_id: str,
         access_token: str,
+        page_name: str = "",
         api_version: str = "v21.0",
         timeout: int = 120,
         logger: Optional[logging.Logger] = None
@@ -34,12 +35,14 @@ class FacebookClient:
         Args:
             page_id: Facebook Page ID
             access_token: Page Access Token with pages_manage_posts permission
+            page_name: Display name of the page (fetched from API if not provided)
             api_version: Graph API version (default: v21.0)
             timeout: Request timeout in seconds
             logger: Logger instance
         """
         self.page_id = page_id
         self.access_token = access_token
+        self.page_name = page_name
         self.api_version = api_version
         self.timeout = timeout
         self.logger = logger or logging.getLogger(__name__)
@@ -67,6 +70,9 @@ class FacebookClient:
 
             if response.status_code == 200:
                 data = response.json()
+                # Fetch and store page name from API
+                if 'name' in data:
+                    self.page_name = data['name']
                 self.logger.info(f"Connected to page: {data.get('name')} (ID: {data.get('id')})")
                 return True
             else:
