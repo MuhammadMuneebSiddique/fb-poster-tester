@@ -1,17 +1,15 @@
 """
 Video Downloader Module
 Handles downloading content from Instagram, TikTok, and other platforms.
-Uses platform-specific libraries: yt-dlp for YouTube, rapidok for TikTok,
+Uses platform-specific libraries: yt-dlp for YouTube and TikTok,
 and instaloader for Instagram.
-
-TikTok downloading uses rapidok.main.download_from_url() which internally
-uses yt-dlp but provides TikTok-specific handling and output organization.
 """
 
 import json
 import logging
 import subprocess
 import shutil
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
@@ -19,7 +17,6 @@ from datetime import datetime
 from enum import Enum
 import uuid
 
-from rapidok.main import download_from_url
 import instaloader
 
 
@@ -56,100 +53,6 @@ class DownloadedContent:
     metadata: Dict[str, Any] = field(default_factory=dict)
     status: DownloadStatus = DownloadStatus.COMPLETED
     error_message: str = ""
-
-
-def _create_tiktok_download_args(download_folder: Path) -> Any:
-    """
-    Create a minimal args namespace for rapidok download_from_url().
-
-    rapidok.main.download_from_url() expects an args object with attributes:
-    - output_dir: base output directory
-    - skip_existing: whether to skip existing files
-    - no_rate_limit: whether to disable rate limiting
-    - no_watermark: whether to download without watermarks
-    - throttle_rate: download speed limit
-    - save_metadata: whether to save metadata (accessed by rapidok)
-    """
-
-    class _Args:
-        def __init__(self, download_folder: Path):
-            self.output_dir = str(download_folder)
-            self.skip_existing = False
-            self.no_rate_limit = False
-            self.no_watermark = True  # Default: download without watermarks
-            self.throttle_rate = None
-            self.save_metadata = False  # rapidok accesses this attribute
-
-    args = _Args(download_folder)
-    return args
-
-
-def _download_tiktok_with_rapidok(url: str, downloader: 'VideoDownloader') -> Optional[Path]:
-    """
-    Download a TikTok video using rapidok.
-
-    Uses rapidok.main.download_from_url() which internally uses yt-dlp
-    but is the recommended library for TikTok downloading.
-
-    Args:
-        url: TikTok video URL
-        downloader: VideoDownloader instance for folder path
-
-    Returns:
-        Path to the downloaded media file, or None on failure
-    """
-    import re
-
-    try:
-        # Create args for rapidok
-        args = _create_tiktok_download_args(downloader.download_folder)
-
-        # Extract username and video ID from URL BEFORE downloading
-        # URL format: https://www.tiktok.com/@username/video/VIDEO_ID
-        username_match = re.search(r'@([a-zA-Z0-9_.]+)', url)
-        video_id_match = re.search(r'/video/([0-9a-zA-Z]+)', url)
-
-        if not username_match or not video_id_match:
-            downloader.logger.error(f"Could not extract username/video_id from TikTok URL: {url}")
-            return None
-
-        username = username_match.group(1)
-        video_id = video_id_match.group(1)
-
-        # Track the expected output directory and file pattern
-        expected_dir = downloader.download_folder / username
-        expected_pattern = f"{video_id}.*"
-
-        # Call rapidok download function
-        download_from_url(
-            link=url,
-            watermark=False,  # No watermarks by default
-            args=args,
-            delay_min=1.0,
-            delay_max=3.0
-        )
-
-        # rapidok saves to {output_dir}/{username}/{video_id}.{ext}
-        # Look SPECIFICALLY for the file matching the current video ID
-        if expected_dir.exists():
-            # Find the exact file for this video ID
-            candidate_files = list(expected_dir.glob(f"{video_id}.*"))
-            media_files = [f for f in candidate_files if f.is_file() and f.suffix.lower() in ['.mp4', '.webm', '.mkv', '.m4a', '.mp3', '.jpg', '.jpeg'] and f.stat().st_size > 0]
-
-            if media_files:
-                # Return the main media file (largest among matches for this video ID)
-                main_file = max(media_files, key=lambda f: f.stat().st_size)
-                downloader.logger.info(
-                    f" rapidok downloaded TikTok video to: {main_file} (video_id={video_id})"
-                )
-                return main_file
-
-        downloader.logger.warning(f" rapidok download completed but file not found for video_id={video_id}")
-        return None
-
-    except Exception as e:
-        downloader.logger.error(f" rapidok TikTok download failed: {e}")
-        return None
 
 
 def _download_instagram_with_instaloader(url: str, downloader: 'VideoDownloader') -> Optional[Path]:
@@ -249,7 +152,7 @@ def _download_instagram_with_instaloader(url: str, downloader: 'VideoDownloader'
 class VideoDownloader:
     """
     Downloads videos and content from Instagram, TikTok, and other platforms.
-    Uses platform-specific libraries: yt-dlp for YouTube, rapidok for TikTok,
+    Uses platform-specific libraries: yt-dlp for YouTube and TikTok,
     and instaloader for Instagram.
     """
 
@@ -326,7 +229,7 @@ class VideoDownloader:
 
         Uses platform-specific downloaders:
         - YouTube: yt-dlp
-        - TikTok: rapidok
+        - TikTok: yt-dlp
         - Instagram: instaloader
 
         Args:
@@ -395,7 +298,7 @@ class VideoDownloader:
             # Default: best format - yt-dlp automatically picks the optimal format for each video
             cmd.extend(["-f", "best"])
 
-        # YouTube-specific options only (TikTok/Instagram now use rapidok/instaloader)
+        # YouTube-specific options only (Instagram uses instaloader, TikTok uses yt-dlp)
         if "youtube.com" in url or "youtu.be" in url or "yt.be" in url:
             cmd.extend([
                 "--extractor-args", "youtube:player_client=android",
@@ -475,57 +378,138 @@ class VideoDownloader:
         """Clear download history."""
         self.download_history.clear()
 
-    def _download_tiktok(self, url: str, download_id: str, custom_title: Optional[str] = None) -> Optional[DownloadedContent]:
+    def _download_tiktok(self, url: str, download_id: str, custom_title: Optional[str] = None, quality: str = "best", extract_audio: bool = False) -> Optional[DownloadedContent]:
         """
-        Download TikTok video using rapidok.
+        Download TikTok video using yt-dlp Python API.
 
         Args:
             url: TikTok video URL
             download_id: Unique ID for this download
             custom_title: Optional custom title for the video
+            quality: Video quality preference (best, 1080p, 720p, 480p, audio)
+            extract_audio: Whether to extract audio only
 
         Returns:
             DownloadedContent object or None on failure
         """
         platform = Platform.TIKTOK
 
-        try:
-            # Use rapidok to download
-            result = _download_tiktok_with_rapidok(url, self)
+        # Create output directory for this download
+        output_dir = self.download_folder / download_id
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-            if not result or not result.exists():
-                error_msg = "rapidok failed to download TikTok video"
+        try:
+            self.logger.info(f"Downloading TikTok video with yt-dlp: {url}")
+
+            import yt_dlp
+            from yt_dlp.utils import DownloadError
+
+            # Build yt-dlp options for TikTok
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'writeinfojson': True,
+                'writethumbnail': True,
+                'outtmpl': str(output_dir / '%(id)s.%(ext)s'),
+                'format': 'bestvideo+bestaudio/best' if not extract_audio else 'bestaudio/best',
+                'merge_output_format': 'mp4' if not extract_audio else 'mp3',
+                'logger': type('Logger', (), {
+                    'debug': lambda s, m: None,
+                    'info': lambda s, m: None,
+                    'warning': lambda s, m: None,
+                    'error': lambda s, m: None,
+                })(),
+            }
+
+            # Add cookies support like YouTube
+            if self.use_cookies_file and Path(self.cookies_file).exists():
+                ydl_opts['cookiefiles'] = self.cookies_file
+
+            if extract_audio:
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }]
+
+            # Download the video
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+
+            if not info:
+                error_msg = "yt-dlp failed to extract video info"
                 self.logger.error(error_msg)
                 return self._create_failed_content(download_id, platform, url, error_msg)
 
-            # Get metadata from file info
-            media_file = result
-            file_size = media_file.stat().st_size
-            mime_type = self._get_mime_type(media_file)
+            # Find downloaded media files
+            downloaded_files = list(output_dir.rglob("*"))
+            media_files = [f for f in downloaded_files if f.is_file() and f.suffix.lower() in ['.mp4', '.webm', '.mkv', '.m4a', '.mp3', '.wav', '.mp4']]
 
-            # Extract title from filename or use custom
-            title = media_file.stem
-            if custom_title:
-                title = custom_title
+            if not media_files:
+                error_msg = f"yt-dlp download completed but no media file found at {output_dir}"
+                self.logger.error(error_msg)
+                return self._create_failed_content(download_id, platform, url, error_msg)
 
-            self.download_history.append(DownloadedContent(
+            # Get the main media file (largest file - usually the video)
+            main_file = max(media_files, key=lambda f: f.stat().st_size)
+
+            # Load metadata from info file
+            info_file = output_dir / f"{main_file.stem}.info.json"
+            metadata = {}
+            if info_file.exists():
+                try:
+                    with open(info_file, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                except Exception as e:
+                    self.logger.warning(f"Failed to load metadata: {e}")
+
+            # Extract info from metadata
+            title = custom_title or metadata.get('title', main_file.stem)
+            description = metadata.get('description', '')
+            duration = metadata.get('duration')
+            uploader = metadata.get('uploader', '')
+            upload_date = metadata.get('upload_date', '')
+
+            # Get file size and mime type
+            file_size = main_file.stat().st_size
+            mime_type = self._get_mime_type(main_file)
+
+            # Try to find thumbnail
+            thumb_files = [f for f in media_files if f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']]
+            thumbnail_path = thumb_files[0] if thumb_files else None
+
+            content = DownloadedContent(
                 id=download_id,
                 platform=platform,
                 original_url=url,
                 title=title,
-                description="",  # No description from rapidok
-                file_path=media_file,
+                description=description,
+                file_path=main_file,
+                thumbnail_path=thumbnail_path,
                 file_size=file_size,
                 mime_type=mime_type,
+                duration=duration,
                 metadata={
+                    **metadata,
+                    'uploader': uploader,
+                    'upload_date': upload_date,
                     'platform': platform.value,
-                    'downloaded_by': 'rapidok'
+                    'downloaded_by': 'yt-dlp'
                 }
-            ))
+            )
 
+            self.download_history.append(content)
             self.logger.info(f"Downloaded TikTok video successfully: {title}")
-            return self.download_history[-1]
+            return content
 
+        except DownloadError as e:
+            error_msg = f"Download failed: {str(e)}"
+            if "bot" in str(e).lower() or "sign in" in str(e).lower():
+                enhanced_error = f"TikTok bot detection triggered.\n\nSolution: Your cookies.txt file may need to be updated.\nPlease refresh your cookies from your browser and replace the existing file.\n\nOriginal error: {error_msg}"
+                self.logger.error(enhanced_error)
+            else:
+                self.logger.error(error_msg)
+            return self._create_failed_content(download_id, platform, url, error_msg)
         except Exception as e:
             error_msg = f"TikTok download error: {str(e)}"
             self.logger.error(error_msg)
