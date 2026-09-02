@@ -69,14 +69,14 @@
       "upload_date": null,
       "timestamp": 1642813451,
       "platform": "tiktok",
-      "status": "pending",
-      "content_id": null,
-      "posted_at": null,
-      "download_attempts": 0,
-      "retry_count": 0,
+      "status": "posted",
+      "content_id": "08633d5d73d0",
+      "posted_at": "2026-09-03T03:32:33.599812",
+      "download_attempts": 1,
+      "retry_count": 1,
       "error_message": "",
       "source_video_id": "7055830039719398682",
-      "last_update_time": null,
+      "last_update_time": "2026-09-03T03:32:33.599812",
       "scheduled_time": null,
       "scheduled_days": [
         "mon",
@@ -1657,7 +1657,7 @@
   ],
   "current_progress": 61,
   "posting_schedule": [
-    "02:30"
+    "03:32"
   ],
   "queue_order": [
     "tiktok_38a4ffc8627ffe9c",
@@ -1724,12 +1724,13 @@
   ],
   "posted_videos": [
     "tiktok_38a4ffc8627ffe9c",
-    "tiktok_7ae634e91efb6f9d"
+    "tiktok_7ae634e91efb6f9d",
+    "tiktok_6520917df2b75712"
   ],
   "failed_videos": [],
-  "last_update_time": "2026-09-03T02:30:23.802425",
+  "last_update_time": "2026-09-03T03:32:33.599929",
   "session_created_time": "2026-09-02T02:16:57.593477",
-  "last_post_time": "2026-09-03T02:30:23.802340",
+  "last_post_time": "2026-09-03T03:32:33.599812",
   "resume_point": 61,
   "total_videos": 61,
   "timezone": "Asia/Karachi"

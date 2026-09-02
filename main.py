@@ -1833,7 +1833,7 @@ class FacebookAutoPoster:
                             session_video.retry_count = item.retry_count
                             session_video.download_attempts = item.retry_count
                             session_video.error_message = str(e)
-                            session_video.last_update_time = datetime.now().isoformat()
+                            session_video.last_update_time = dt_datetime.now().isoformat()
                             if session_video.video_id in self.creator_sync_manager.current_session.failed_videos:
                                 self.creator_sync_manager.current_session.failed_videos.remove(session_video.video_id)
                             self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
@@ -1859,7 +1859,7 @@ class FacebookAutoPoster:
                             session_video.status = VideoStatus.FAILED
                             session_video.download_attempts = item.retry_count
                             session_video.error_message = str(e)
-                            session_video.last_update_time = datetime.now().isoformat()
+                            session_video.last_update_time = dt_datetime.now().isoformat()
                             if session_video.video_id not in self.creator_sync_manager.current_session.failed_videos:
                                 self.creator_sync_manager.current_session.failed_videos.append(session_video.video_id)
                             self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
@@ -1908,7 +1908,7 @@ class FacebookAutoPoster:
                     session_video.retry_count = item.retry_count  # Sync the retry count
                     session_video.download_attempts = item.retry_count
                     session_video.error_message = error_message
-                    session_video.last_update_time = datetime.now().isoformat()
+                    session_video.last_update_time = dt_datetime.now().isoformat()
                     # Remove from failed_videos if it was added there
                     if session_video.video_id in self.creator_sync_manager.current_session.failed_videos:
                         self.creator_sync_manager.current_session.failed_videos.remove(session_video.video_id)
@@ -1941,7 +1941,7 @@ class FacebookAutoPoster:
                     session_video.status = VideoStatus.FAILED
                     session_video.download_attempts = item.retry_count
                     session_video.error_message = error_message
-                    session_video.last_update_time = datetime.now().isoformat()
+                    session_video.last_update_time = dt_datetime.now().isoformat()
                     # Add to failed_videos tracking
                     if session_video.video_id not in self.creator_sync_manager.current_session.failed_videos:
                         self.creator_sync_manager.current_session.failed_videos.append(session_video.video_id)
@@ -1984,7 +1984,7 @@ class FacebookAutoPoster:
                     session_video.retry_count = item.retry_count
                     session_video.download_attempts = item.retry_count
                     session_video.error_message = error
-                    session_video.last_update_time = datetime.now().isoformat()
+                    session_video.last_update_time = dt_datetime.now().isoformat()
                     if session_video.video_id in self.creator_sync_manager.current_session.failed_videos:
                         self.creator_sync_manager.current_session.failed_videos.remove(session_video.video_id)
                     self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
@@ -2010,7 +2010,7 @@ class FacebookAutoPoster:
                     session_video.status = VideoStatus.FAILED
                     session_video.download_attempts = item.retry_count
                     session_video.error_message = error
-                    session_video.last_update_time = datetime.now().isoformat()
+                    session_video.last_update_time = dt_datetime.now().isoformat()
                     if session_video.video_id not in self.creator_sync_manager.current_session.failed_videos:
                         self.creator_sync_manager.current_session.failed_videos.append(session_video.video_id)
                     self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
