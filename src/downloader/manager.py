@@ -422,8 +422,9 @@ class VideoDownloader:
             }
 
             # Add cookies support like YouTube
+            # yt-dlp Python API uses 'cookiefile' (singular) for cookie file path
             if self.use_cookies_file and Path(self.cookies_file).exists():
-                ydl_opts['cookiefiles'] = self.cookies_file
+                ydl_opts['cookiefile'] = self.cookies_file
 
             if extract_audio:
                 ydl_opts['postprocessors'] = [{

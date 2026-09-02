@@ -610,8 +610,16 @@ class SessionManager:
             logger.info(f"[SESSION] Session state persisted successfully")
         return result
 
-    def mark_video_pending_by_url(self, video_url: str, platform: str = "") -> bool:
-        """Reset a video to pending status for retry by its video URL."""
+    def mark_video_pending_by_url(self, video_url: str, platform: str = "", reset_retry: bool = True) -> bool:
+        """
+        Reset a video to pending status for retry by its video URL.
+
+        Args:
+            video_url: The video URL to find
+            platform: Platform name (youtube, tiktok, instagram)
+            reset_retry: If True, reset retry counters (for starting fresh).
+                        If False, keep retry counters (for retry recovery).
+        """
         import logging
         logger = logging.getLogger('creator.session')
 
@@ -626,8 +634,9 @@ class SessionManager:
             return False
 
         video.status = VideoStatus.PENDING
-        video.retry_count = 0
-        video.error_message = ""
+        if reset_retry:
+            video.retry_count = 0
+            video.error_message = ""
         video.download_attempts = 0
         video.last_update_time = datetime.now().isoformat()
         video.posted_at = None
@@ -642,6 +651,32 @@ class SessionManager:
             logger.info(f"[SESSION] Video {video.video_id} marked PENDING for retry - Saving session: {session.total_videos} total, {len(session.posted_videos)} posted, {session.get_pending_count()} pending, {len(session.failed_videos)} failed")
             logger.info(f"[SESSION] Session state persisted successfully")
         return result
+
+    def increment_download_attempt(self, video_id: str, increment_retry: bool = True) -> bool:
+        """
+        Increment download attempt counter for a video.
+
+        Args:
+            video_id: The video ID to update
+            increment_retry: If True, increment retry_count as well
+
+        Returns:
+            True if successful
+        """
+        session = self.load_session()
+        if not session:
+            return False
+
+        video = session.get_video_by_id(video_id)
+        if not video:
+            return False
+
+        video.download_attempts += 1
+        if increment_retry:
+            video.retry_count += 1
+        video.last_update_time = datetime.now().isoformat()
+
+        return self.save_session(session)
 
     def add_video_to_session(self, video: SessionVideo,
                              position: int = None) -> bool:

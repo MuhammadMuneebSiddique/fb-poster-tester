@@ -1677,19 +1677,30 @@ class FacebookAutoPoster:
             self.posting_queue.mark_as_downloading(item.id)
 
             # Update session status - mark as processing for crash recovery
+            # Track download attempts: first attempt is 1, retries increment from there
             if self.creator_sync_manager and self.creator_sync_manager.current_session:
                 session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
                     item.source_video_id or "", item.platform or ""
                 )
                 if session_video:
+                    # Increment download attempts for this attempt
+                    session_video.download_attempts += 1
+                    # Sync retry_count with download_attempts
+                    session_video.retry_count = session_video.download_attempts
                     session_video.status = VideoStatus.PROCESSING
                     self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
-                    self.logger.info(f"[SESSION] Video {session_video.video_id} marked PROCESSING")
+                    self.logger.info(f"[SESSION] Video {session_video.video_id} marked PROCESSING (attempt {session_video.retry_count}/3)")
                     self.logger.info(f"[SESSION] Saving session: {self.creator_sync_manager.current_session.total_videos} total, {len(self.creator_sync_manager.current_session.posted_videos)} posted, {self.creator_sync_manager.current_session.get_pending_count()} pending")
+
+            # Determine current attempt number for display
+            # retry_count tracks the number of previous failures (0, 1, 2)
+            # Current attempt = retry_count + 1 (so 1, 2, 3)
+            attempt_num = getattr(item, 'retry_count', 0) + 1
 
             # Download video
             console.print(f"\n[cyan]{ICONS['download']} Downloading video...[/cyan]")
-            self.logger.info(f"Downloading video for creator job: {item.video_url}")
+            console.print(f"[info]{ICONS['clock']} Download attempt {attempt_num}/3[/info]")
+            self.logger.info(f"Downloading video for creator job: {item.video_url} (attempt {attempt_num}/3)")
 
             downloaded_contents = self.video_downloader.download_multiple([item.video_url])
 
@@ -1796,64 +1807,216 @@ class FacebookAutoPoster:
             self.logger.error(f"Job {job_id} execution error: {e}", exc_info=True)
             console.print(f"[error]{ICONS['x']} ERROR: {e}[/error]")
             if 'item' in dir() and item and hasattr(item, 'retry_count'):
-                self._handle_post_failure(item, str(e))
+                # Handle exception with retry logic for download errors
+                import time
 
-                # Update session status for page-scoped persistence
-                if self.creator_sync_manager and self.creator_sync_manager.current_session:
-                    if item.retry_count < 3:
-                        # Reset to pending for retry using proper method
-                        self.creator_sync_manager.session_manager.mark_video_pending_by_url(
-                            item.video_url,
-                            platform=item.platform or ""
+                # Increment retry count for tracking
+                item.retry_count += 1
+                retry_attempt = item.retry_count
+
+                # Log the retry attempt
+                console.print(f"[warning]{ICONS['warning']} Download attempt {retry_attempt}/3 failed due to error[/warning]")
+                self.logger.info(f"Download attempt {retry_attempt}/3 failed for: {item.title} - Error: {str(e)[:100]}")
+
+                if retry_attempt < 3:
+                    # Not all attempts exhausted - reset to pending for retry
+                    item.status = "pending"
+                    item.error_message = str(e)
+
+                    # Update session status
+                    if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                        session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                            item.source_video_id or "", item.platform or ""
                         )
-                        self.logger.info(f"[SESSION] Reset video to PENDING for retry: {item.title}")
-                    else:
-                        # Mark as failed
-                        self.creator_sync_manager.session_manager.mark_video_failed_by_source(
-                            item.source_video_id or "",
-                            error_message=str(e),
-                            platform=item.platform or ""
+                        if session_video:
+                            session_video.status = VideoStatus.PENDING
+                            session_video.retry_count = item.retry_count
+                            session_video.download_attempts = item.retry_count
+                            session_video.error_message = str(e)
+                            session_video.last_update_time = datetime.now().isoformat()
+                            if session_video.video_id in self.creator_sync_manager.current_session.failed_videos:
+                                self.creator_sync_manager.current_session.failed_videos.remove(session_video.video_id)
+                            self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                            self.logger.info(f"[SESSION] Video {session_video.video_id} reset to PENDING (attempt {retry_attempt}/3)")
+
+                    # Small delay before next retry
+                    console.print(f"[info]{ICONS['clock']} Waiting 2 seconds before retry...[/info]")
+                    time.sleep(2)
+                else:
+                    # All 3 attempts failed - mark as FAILED
+                    console.print(f"[error]{ICONS['x']} All 3 attempts failed → Marking video as FAILED[/error]")
+                    self.logger.warning(f"All 3 download attempts failed for: {item.title} - Final error: {str(e)[:200]}")
+
+                    item.status = "failed"
+                    item.error_message = str(e)
+
+                    # Update session status - mark as FAILED with error message
+                    if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                        session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                            item.source_video_id or "", item.platform or ""
                         )
-                        self.logger.info(f"[SESSION] Updated video status to FAILED in session for {item.title}")
+                        if session_video:
+                            session_video.status = VideoStatus.FAILED
+                            session_video.download_attempts = item.retry_count
+                            session_video.error_message = str(e)
+                            session_video.last_update_time = datetime.now().isoformat()
+                            if session_video.video_id not in self.creator_sync_manager.current_session.failed_videos:
+                                self.creator_sync_manager.current_session.failed_videos.append(session_video.video_id)
+                            self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                            self.logger.info(f"[SESSION] Video {session_video.video_id} marked FAILED (attempt 3/3) - Reason: {str(e)[:200]}")
+                        else:
+                            # Video not in session - just mark item as failed
+                            pass
+
+                    self._show_queue_status()
             else:
                 # Item might be None or invalid, log and continue
                 self.logger.warning(f"Could not update queue for failed job {job_id}")
 
-    def _handle_download_failure(self, item: 'QueueItem'):
-        """Handle a failed download by marking the item for retry or failure."""
-        self.posting_queue.mark_as_failed(item.id, "Download failed")
-        self._show_queue_status()
+    def _handle_download_failure(self, item: 'QueueItem', error_message: str = "Download failed"):
+        """
+        Handle a failed download with retry logic.
 
-        # Update session status for page-scoped persistence
-        if self.creator_sync_manager and self.creator_sync_manager.current_session:
-            self.creator_sync_manager.session_manager.mark_video_failed_by_source(
-                item.source_video_id or "",
-                error_message="Download failed",
-                platform=item.platform or ""
-            )
-            self.logger.info(f"[SESSION] Updated video status to FAILED in session for {item.title}")
+        Retries up to 3 times with a short delay between attempts.
+        Only marks as FAILED after all retries are exhausted.
+
+        The retry_count tracks the number of failed attempts (1, 2, 3).
+        After 3 failures, the video is marked as FAILED.
+        """
+        import time
+
+        # Increment retry count for tracking (this is the attempt number)
+        item.retry_count += 1
+        retry_attempt = item.retry_count
+
+        # Log the retry attempt
+        console.print(f"[warning]{ICONS['warning']} Download attempt {retry_attempt}/3 failed[/warning]")
+        self.logger.info(f"Download attempt {retry_attempt}/3 for: {item.title} - Error: {error_message[:100] if error_message else 'Unknown'}")
+
+        if retry_attempt < 3:
+            # Not all attempts exhausted - reset to pending for retry
+            item.status = "pending"
+            item.error_message = error_message  # Store error for debugging
+
+            # Update session status - set to PENDING but KEEP retry_count
+            if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                    item.source_video_id or "", item.platform or ""
+                )
+                if session_video:
+                    session_video.status = VideoStatus.PENDING
+                    session_video.retry_count = item.retry_count  # Sync the retry count
+                    session_video.download_attempts = item.retry_count
+                    session_video.error_message = error_message
+                    session_video.last_update_time = datetime.now().isoformat()
+                    # Remove from failed_videos if it was added there
+                    if session_video.video_id in self.creator_sync_manager.current_session.failed_videos:
+                        self.creator_sync_manager.current_session.failed_videos.remove(session_video.video_id)
+                    self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                    self.logger.info(f"[SESSION] Video {session_video.video_id} reset to PENDING (attempt {retry_attempt}/3)")
+                else:
+                    # Video not in session - just keep item pending
+                    pass
+            else:
+                # No session manager - just keep item pending
+                pass
+
+            # Small delay before next retry (2 seconds as short delay)
+            console.print(f"[info]{ICONS['clock']} Waiting 2 seconds before retry...[/info]")
+            time.sleep(2)
+        else:
+            # All 3 attempts failed - mark as FAILED
+            console.print(f"[error]{ICONS['x']} All 3 attempts failed → Marking video as FAILED[/error]")
+            self.logger.warning(f"All 3 download attempts failed for: {item.title} - Final error: {error_message[:200] if error_message else 'Unknown'}")
+
+            item.status = "failed"
+            item.error_message = error_message
+
+            # Update session status - mark as FAILED with error message
+            if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                    item.source_video_id or "", item.platform or ""
+                )
+                if session_video:
+                    session_video.status = VideoStatus.FAILED
+                    session_video.download_attempts = item.retry_count
+                    session_video.error_message = error_message
+                    session_video.last_update_time = datetime.now().isoformat()
+                    # Add to failed_videos tracking
+                    if session_video.video_id not in self.creator_sync_manager.current_session.failed_videos:
+                        self.creator_sync_manager.current_session.failed_videos.append(session_video.video_id)
+                    self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                    self.logger.info(f"[SESSION] Video {session_video.video_id} marked FAILED (attempt 3/3) - Reason: {error_message[:200] if error_message else 'No details'}")
+                else:
+                    # Video not in session - just mark item as failed
+                    pass
+
+        self._show_queue_status()
 
     def _handle_post_failure(self, item: 'QueueItem', error: str = ""):
-        """Handle a failed post with retry logic."""
-        item.retry_count += 1
+        """
+        Handle a failed post with retry logic.
 
-        if item.retry_count < 3:
-            item.status = "pending"  # Will retry
-            # Only save if queue saves are enabled (creator mode disables queue saves)
-            if self.posting_queue._should_save():
-                self.posting_queue._save()
-            console.print(f"[warning]{ICONS['warning']} Retry #{item.retry_count} scheduled[/warning]")
+        Retries up to 3 times with a short delay between attempts.
+        Updates session status for page-scoped persistence.
+        """
+        import time
+
+        # Increment retry count for tracking
+        item.retry_count += 1
+        retry_attempt = item.retry_count
+
+        # Log the retry attempt
+        console.print(f"[warning]{ICONS['warning']} Post attempt {retry_attempt}/3 failed: {error[:100] if error else 'Unknown'}[/warning]")
+        self.logger.info(f"Post attempt {retry_attempt}/3 failed for: {item.title} - Error: {error[:100] if error else 'Unknown'}")
+
+        if retry_attempt < 3:
+            # Not all attempts exhausted - reset to pending for retry
+            item.status = "pending"
+
+            # Update session status
+            if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                    item.source_video_id or "", item.platform or ""
+                )
+                if session_video:
+                    session_video.status = VideoStatus.PENDING
+                    session_video.retry_count = item.retry_count
+                    session_video.download_attempts = item.retry_count
+                    session_video.error_message = error
+                    session_video.last_update_time = datetime.now().isoformat()
+                    if session_video.video_id in self.creator_sync_manager.current_session.failed_videos:
+                        self.creator_sync_manager.current_session.failed_videos.remove(session_video.video_id)
+                    self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                    self.logger.info(f"[SESSION] Video {session_video.video_id} reset to PENDING for post retry (attempt {retry_attempt}/3)")
+
+            # Small delay before next retry
+            console.print(f"[info]{ICONS['clock']} Waiting 2 seconds before retry...[/info]")
+            time.sleep(2)
         else:
+            # All 3 attempts failed - mark as FAILED
+            console.print(f"[error]{ICONS['x']} All 3 attempts failed → Marking video as FAILED[/error]")
+            self.logger.warning(f"All 3 post attempts failed for: {item.title} - Final error: {error[:200] if error else 'Unknown'}")
+
             item.status = "failed"
-            # Only save if queue saves are enabled (creator mode disables queue saves)
-            if self.posting_queue._should_save():
-                self.posting_queue._save()
-            console.print(f"[error]{ICONS['x']} Max retries reached. Marking as failed.[/error]")
+            item.error_message = error
+
+            # Update session status - mark as FAILED with error message
+            if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                    item.source_video_id or "", item.platform or ""
+                )
+                if session_video:
+                    session_video.status = VideoStatus.FAILED
+                    session_video.download_attempts = item.retry_count
+                    session_video.error_message = error
+                    session_video.last_update_time = datetime.now().isoformat()
+                    if session_video.video_id not in self.creator_sync_manager.current_session.failed_videos:
+                        self.creator_sync_manager.current_session.failed_videos.append(session_video.video_id)
+                    self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                    self.logger.info(f"[SESSION] Video {session_video.video_id} marked FAILED (attempt 3/3) - Reason: {error[:200] if error else 'No details'}")
 
         self._show_queue_status()
-
-        # Update session status for page-scoped persistence (already done in _execute_creator_job else branch)
-        # This is called from download failure which happens before the try block's success/failure handling
 
     def _schedule_daily_resync(self, _creator_url: str = None):
         """

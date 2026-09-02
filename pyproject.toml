@@ -22,6 +22,8 @@ dependencies = [
     "ffmpeg-python>=0.2.0",
     "instaloader>=4.11",
     "pytz>=2026.3.post1",
+    "tiktokapi>=7.3.3",
+    "tiktok-downloader>=0.3.5",
 ]
 
 [project.optional-dependencies]
