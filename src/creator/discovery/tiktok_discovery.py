@@ -73,7 +73,7 @@ class TikTokDiscovery:
             return match.group(1)
         return ""
 
-    def discover_video_urls(self, profile_url: str, max_videos: int = 100) -> List[TikTokVideoInfo]:
+    def discover_video_urls(self, profile_url: str, max_videos: int = 0) -> List[TikTokVideoInfo]:
         """
         Discover all public TikTok video URLs from a profile using yt-dlp.
 
@@ -82,7 +82,7 @@ class TikTokDiscovery:
 
         Args:
             profile_url: TikTok profile URL (e.g., https://www.tiktok.com/@username)
-            max_videos: Maximum number of videos to discover (0 = unlimited)
+            max_videos: Maximum number of videos to discover (0 = unlimited, no limit)
 
         Returns:
             List of TikTokVideoInfo objects with video URLs and metadata

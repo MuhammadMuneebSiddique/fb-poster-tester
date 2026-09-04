@@ -45,6 +45,7 @@ class CreatorVideo:
     posted_at: Optional[str] = None  # ISO timestamp
     content_id: Optional[str] = None  # Generated after download
     download_attempts: int = 0  # Count of download attempts for retry
+    video_id: Optional[str] = None  # Page-scoped video identifier (for session matching)
     source_video_id: Optional[str] = None  # Source platform video ID (e.g., TikTok aweme ID)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -60,6 +61,7 @@ class CreatorVideo:
             "status": self.status,
             "posted_at": self.posted_at,
             "content_id": self.content_id,
+            "video_id": self.video_id,
             "source_video_id": self.source_video_id,
         }
 
@@ -77,6 +79,7 @@ class CreatorVideo:
             status=data.get("status", "pending"),
             posted_at=data.get("posted_at"),
             content_id=data.get("content_id"),
+            video_id=data.get("video_id"),
             source_video_id=data.get("source_video_id"),
         )
 
@@ -90,9 +93,10 @@ class CreatorSyncManager:
     the posting queue.
 
     INTEGRATED: Session persistence with page-scoped isolation via SessionManager.
+    The session file (sessions/page_<page_id>.json) is the single source of truth.
     """
 
-    def __init__(self, queue_file: str = "content/creator_queue.json",
+    def __init__(self,
                  logger: Optional[logging.Logger] = None,
                  use_cookies_file: bool = True,
                  cookies_file: str = "cookies.txt",
@@ -101,15 +105,12 @@ class CreatorSyncManager:
         Initialize the Creator Sync Manager.
 
         Args:
-            queue_file: Path to the JSON file storing the video queue
             logger: Logger instance
             use_cookies_file: Whether to use cookies.txt file for YouTube authentication
             cookies_file: Path to cookies.txt file
             page_id: Facebook Page ID for page-scoped session management
         """
         self.logger = logger or logging.getLogger(__name__)
-        self.queue_file = Path(queue_file)
-        self.queue_file.parent.mkdir(parents=True, exist_ok=True)
 
         # Cookie settings for YouTube authentication
         self.use_cookies_file = use_cookies_file
@@ -117,9 +118,6 @@ class CreatorSyncManager:
 
         # Page ID for session isolation
         self.page_id = page_id
-
-        # Save control - disabled during creator mode (session file is source of truth)
-        self._save_enabled = True
 
         # Check if cookies.txt exists for YouTube operations
         if self.use_cookies_file and Path(self.cookies_file).exists():
@@ -142,6 +140,9 @@ class CreatorSyncManager:
                 self.creator_url = self.current_session.creator_url
                 self.creator_name = self.current_session.creator_name
                 self.logger.info(f"Loaded incomplete session for page {page_id}")
+
+        # Save control - disabled during creator mode (session file is source of truth)
+        self._save_enabled = True
 
     def disable_save(self, disabled: bool = True):
         """Disable automatic saving to the creator queue file."""
@@ -226,10 +227,6 @@ class CreatorSyncManager:
             # After discovery, videos are already synced to session
             # Return the in-memory videos (don't reload from queue file)
             self.logger.info(f"Extracted {len(self.videos)} Instagram videos via discovery")
-
-            # Sync to session if page-scoped persistence is enabled
-            if self.session_manager and self.current_session:
-                self._sync_videos_to_session(self.videos, "instagram")
             return self.videos
 
         # Use yt-dlp to extract video information (YouTube - unchanged)
@@ -249,8 +246,13 @@ class CreatorSyncManager:
         self.logger.info(f"Extracted {len(videos)} videos from {creator_url}")
 
         # Sync to session for page-scoped persistence (YouTube needs this unlike TikTok/Instagram)
+        # Check if this is a fresh sync (session has no videos)
+        is_fresh_sync = False
+        if self.session_manager and self.current_session and len(self.current_session.videos) == 0:
+            is_fresh_sync = True
+
         if self.session_manager and self.current_session:
-            self._sync_videos_to_session(videos, platform)
+            self._sync_videos_to_session(videos, platform, replace_all=is_fresh_sync)
 
         return videos
 
@@ -439,9 +441,9 @@ class CreatorSyncManager:
         # Initialize TikTok discovery
         discovery = TikTokDiscovery(logger=self.logger)
 
-        # Discover video URLs from the profile
+        # Discover video URLs from the profile (no artificial limit - discover all videos)
         console.print(f"[info]{ICONS['info']} Discovering TikTok videos from profile...[/info]")
-        video_infos = discovery.discover_video_urls(profile_url, max_videos=100)
+        video_infos = discovery.discover_video_urls(profile_url, max_videos=0)
 
         if not video_infos:
             console.print(f"[error]{ICONS['x']} No TikTok videos discovered for {self.creator_name}[/error]")
@@ -453,6 +455,13 @@ class CreatorSyncManager:
         # Step 2: Save ALL discovered URLs to the persistent queue
         # NO yt-dlp validation during discovery - URLs are saved regardless
         console.print(f"[cyan]{ICONS['download']} Saving {len(video_infos)} TikTok video URLs to persistent queue...[/cyan]")
+
+        # Check if this is a fresh sync (session has no videos) - clear in-memory list for clean replace
+        is_fresh_sync = False
+        if self.current_session and len(self.current_session.videos) == 0:
+            is_fresh_sync = True
+            self.logger.info(f"[SESSION] Fresh sync detected - clearing in-memory videos for clean replace")
+            self.videos = []
 
         seen_urls = set()
         new_videos = []
@@ -488,9 +497,15 @@ class CreatorSyncManager:
             console.print(f"[warning]{ICONS['warning']} No new unique videos to add to queue[/warning]")
             return 0
 
-        # Add new videos to existing queue (preserving chronological order)
-        # Sort new videos by timestamp (oldest first), then merge with existing
-        all_videos = self.videos + new_videos
+        # For fresh sync, use only new videos; for re-sync, merge with existing
+        # This prevents stale videos from previous creators from being mixed in
+        if is_fresh_sync:
+            all_videos = new_videos
+            self.logger.info(f"[SESSION] Fresh sync: using only new videos, ignoring {len(self.videos)} existing in-memory videos")
+        else:
+            # Add new videos to existing queue (preserving chronological order)
+            # Sort new videos by timestamp (oldest first), then merge with existing
+            all_videos = self.videos + new_videos
         all_videos.sort(key=lambda v: (v.timestamp or 0) or 9999999999)
 
         # Deduplicate by video_url, keeping first occurrence (oldest)
@@ -503,9 +518,6 @@ class CreatorSyncManager:
 
         self.videos = final_videos
         videos_added = len(new_videos)
-        # Only save to queue file if saves are enabled (session file is source of truth in creator mode)
-        if self._should_save():
-            self._save_queue()
 
         console.print(f"[success]{ICONS['check']} Added {videos_added} TikTok videos to posting queue[/success]")
         console.print(f"[info]{ICONS['info']} Total queue: {len(self.videos)} videos (chronological, oldest first)[/info]")
@@ -515,7 +527,7 @@ class CreatorSyncManager:
 
         # Sync to session for page-scoped persistence
         if self.session_manager and self.current_session:
-            self._sync_videos_to_session(self.videos, "tiktok")
+            self._sync_videos_to_session(self.videos, "tiktok", replace_all=is_fresh_sync)
 
         return videos_added
 
@@ -566,9 +578,9 @@ class CreatorSyncManager:
         # Initialize Instagram discovery
         discovery = InstagramDiscovery(logger=self.logger)
 
-        # Discover video URLs from the profile
+        # Discover video URLs from the profile (no artificial limit - discover all videos)
         console.print(f"[info]{ICONS['info']} Discovering Instagram videos from profile...[/info]")
-        media_infos = discovery.discover_video_urls(profile_url, max_videos=100)
+        media_infos = discovery.discover_video_urls(profile_url, max_videos=0)
 
         if not media_infos:
             console.print(f"[error]{ICONS['x']} No Instagram videos discovered for {self.creator_name}[/error]")
@@ -580,6 +592,13 @@ class CreatorSyncManager:
         # Step 2: Save ALL discovered URLs to the persistent queue
         # NO yt-dlp validation during discovery - URLs are saved regardless
         console.print(f"[cyan]{ICONS['download']} Saving {len(media_infos)} Instagram video URLs to persistent queue...[/cyan]")
+
+        # Check if this is a fresh sync (session has no videos) - clear in-memory list for clean replace
+        is_fresh_sync = False
+        if self.current_session and len(self.current_session.videos) == 0:
+            is_fresh_sync = True
+            self.logger.info(f"[SESSION] Fresh sync detected - clearing in-memory videos for clean replace")
+            self.videos = []
 
         seen_urls = set()
         new_videos = []
@@ -615,9 +634,15 @@ class CreatorSyncManager:
             console.print(f"[warning]{ICONS['warning']} No new unique videos to add to queue[/warning]")
             return 0
 
-        # Add new videos to existing queue (preserving chronological order)
-        # Sort new videos by timestamp (oldest first), then merge with existing
-        all_videos = self.videos + new_videos
+        # For fresh sync, use only new videos; for re-sync, merge with existing
+        # This prevents stale videos from previous creators from being mixed in
+        if is_fresh_sync:
+            all_videos = new_videos
+            self.logger.info(f"[SESSION] Fresh sync: using only new videos, ignoring {len(self.videos)} existing in-memory videos")
+        else:
+            # Add new videos to existing queue (preserving chronological order)
+            # Sort new videos by timestamp (oldest first), then merge with existing
+            all_videos = self.videos + new_videos
         all_videos.sort(key=lambda v: (v.timestamp or 0) or 9999999999)
 
         # Deduplicate by video_url, keeping first occurrence (oldest)
@@ -630,9 +655,6 @@ class CreatorSyncManager:
 
         self.videos = final_videos
         videos_added = len(new_videos)
-        # Only save to queue file if saves are enabled (session file is source of truth in creator mode)
-        if self._should_save():
-            self._save_queue()
 
         console.print(f"[success]{ICONS['check']} Added {videos_added} Instagram videos to posting queue[/success]")
         console.print(f"[info]{ICONS['info']} Total queue: {len(self.videos)} videos (chronological, oldest first)[/info]")
@@ -642,7 +664,7 @@ class CreatorSyncManager:
 
         # Sync to session for page-scoped persistence
         if self.session_manager and self.current_session:
-            self._sync_videos_to_session(self.videos, "instagram")
+            self._sync_videos_to_session(self.videos, "instagram", replace_all=is_fresh_sync)
 
         return videos_added
 
@@ -749,8 +771,6 @@ class CreatorSyncManager:
         if not all_videos:
             console.print(f"[warning]{ICONS['warning']} No videos found for {self.creator_name}[/warning]")
             self.videos = []
-            if self._should_save():
-                self._save_queue()
             return 0
 
         # Sort by timestamp (oldest first)
@@ -766,8 +786,6 @@ class CreatorSyncManager:
                 seen_urls.add(video.video_url)
 
         self.videos = final_videos
-        if self._should_save():
-            self._save_queue()
 
         total_count = len(final_videos)
 
@@ -836,8 +854,6 @@ class CreatorSyncManager:
 
         if new_videos:
             # Append to existing queue (they're already there from discovery, just re-mark)
-            if self._should_save():
-                self._save_queue()
             console.print(f"[success]{ICONS['check']} Added {len(new_videos)} new/remaining videos from {self.creator_name}[/success]")
 
             # Sync new videos to session for persistence
@@ -853,47 +869,6 @@ class CreatorSyncManager:
     def get_existing_urls(self) -> set:
         """Get set of all video URLs in current queue."""
         return {v.video_url for v in self.videos}
-
-    def _load_queue(self) -> List[CreatorVideo]:
-        """Load video queue from JSON file."""
-        if not self.queue_file.exists():
-            return []
-
-        try:
-            with open(self.queue_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            videos = []
-            for item in data.get('videos', []):
-                videos.append(CreatorVideo.from_dict(item))
-
-            self.creator_name = data.get('creator_name')
-            self.creator_url = data.get('creator_url')
-
-            return videos
-        except Exception as e:
-            self.logger.error(f"Failed to load queue: {e}")
-            return []
-
-    def _save_queue(self):
-        """Save video queue to JSON file."""
-        if not self._save_enabled:
-            return  # Skip saving during creator mode - session file is the source of truth
-
-        data = {
-            "creator_name": self.creator_name,
-            "creator_url": self.creator_url,
-            "last_sync": datetime.now().isoformat(),
-            "videos": [v.to_dict() for v in self.videos],
-            "total_videos": len(self.videos),
-            "pending_count": sum(1 for v in self.videos if v.status == "pending"),
-            "posted_count": sum(1 for v in self.videos if v.status == "posted"),
-            "failed_count": sum(1 for v in self.videos if v.status == "failed"),
-            "downloading_count": sum(1 for v in self.videos if v.status == "downloading"),
-        }
-
-        with open(self.queue_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
 
     def _session_video_to_creator_video(self, session_video: 'SessionVideo') -> 'CreatorVideo':
         """
@@ -953,7 +928,6 @@ class CreatorSyncManager:
             video_id = self.session_manager.generate_video_id(platform, video.source_video_id)
         else:
             # Fallback: hash the URL
-            import hashlib
             video_id = f"{video.platform}_{hashlib.md5((self.page_id + video.video_url).encode()).hexdigest()[:16]}"
 
         self.logger.debug(f"[SESSION] Converting CreatorVideo -> SessionVideo: {video_id}")
@@ -975,27 +949,56 @@ class CreatorSyncManager:
             source_video_id=video.source_video_id,
         )
 
-    def _sync_videos_to_session(self, videos: List[CreatorVideo], platform: str) -> bool:
+    def _sync_videos_to_session(self, videos: List[CreatorVideo], platform: str, replace_all: bool = False) -> bool:
         """
         Sync videos to the page-scoped session for persistent tracking.
 
         This ensures video status is tracked per-page and survives crashes.
+        Handles both new videos and updates to existing videos.
+
+        Args:
+            videos: List of CreatorVideo objects to sync
+            platform: Platform name (youtube, tiktok, instagram)
+            replace_all: If True, clear all existing videos and replace with new list.
+                        Used during fresh sync after session reset.
         """
         if not self.session_manager or not self.current_session:
             return False
 
         try:
+            # If replace_all is True, clear existing videos (fresh sync scenario)
+            if replace_all:
+                self.logger.info(f"[SESSION] Clearing {len(self.current_session.videos)} existing videos for fresh sync")
+                self.logger.info(f"[SESSION] Resetting all session state for clean slate")
+                self.current_session.videos = []
+                self.current_session.queue_order = []
+                self.current_session.posted_videos = []
+                self.current_session.failed_videos = []
+                self.current_session.current_progress = 0
+                self.current_session.resume_point = 0
+                self.current_session.posting_schedule = []
+                self.current_session.selected_video_count = 0
+                self.current_session.total_videos = 0
+
             # Add any new videos directly to the in-memory session
             for video in videos:
                 if video.status == "pending":
                     session_video = self._creator_video_to_session_video(video)
                     if session_video:
                         # Check if already in session by video_id
-                        if not self.current_session.get_video_by_id(session_video.video_id):
+                        existing_sv = self.current_session.get_video_by_id(session_video.video_id)
+                        if existing_sv:
+                            # Update existing session video with new status
+                            existing_sv.status = VideoStatus.PENDING
+                            existing_sv.platform = video.platform
+                            existing_sv.source_video_id = video.source_video_id
+                            existing_sv.download_attempts = video.download_attempts
+                            existing_sv.error_message = ""
+                        else:
+                            # Add new video to session
                             session_video.status = VideoStatus.PENDING
                             session_video.platform = video.platform
                             session_video.source_video_id = video.source_video_id
-                            # Add directly to in-memory session
                             self.current_session.videos.append(session_video)
                             # Update queue_order
                             if session_video.video_id not in self.current_session.queue_order:
@@ -1071,28 +1074,60 @@ class CreatorSyncManager:
         video.status = "posted"
         video.posted_at = datetime.now().isoformat()
         video.content_id = content_id
-        if self._should_save():
-            self._save_queue()
+        self._sync_video_status_to_session(video, "posted", content_id)
 
     def mark_as_downloading(self, video: CreatorVideo):
         """Mark a video as currently being downloaded."""
         video.status = "downloading"
         video.download_attempts += 1
-        if self._should_save():
-            self._save_queue()
+        self._sync_video_status_to_session(video, "downloading")
 
     def mark_as_downloaded(self, video: CreatorVideo):
         """Mark a video as successfully downloaded."""
         video.status = "downloaded"
-        if self._should_save():
-            self._save_queue()
+        self._sync_video_status_to_session(video, "downloaded")
 
     def mark_as_failed(self, video: CreatorVideo, error: str = ""):
         """Mark a video as failed."""
         video.status = "failed"
-        if self._should_save():
-            self._save_queue()
         self.logger.error(f"Video {video.title} failed: {error}")
+        self._sync_video_status_to_session(video, "failed", error_message=error)
+
+    def _sync_video_status_to_session(self, video: CreatorVideo, status: str, content_id: Optional[str] = None, error_message: str = ""):
+        """Sync video status change to the session file."""
+        if not self.session_manager or not self.current_session:
+            return
+
+        try:
+            # Find the matching session video
+            session_video = self._creator_video_to_session_video(video)
+            if not session_video:
+                return
+
+            existing_sv = self.current_session.get_video_by_id(session_video.video_id)
+            if existing_sv:
+                from src.creator.session import VideoStatus
+                if status == "posted":
+                    existing_sv.status = VideoStatus.POSTED
+                    existing_sv.posted_at = datetime.now().isoformat()
+                    existing_sv.content_id = content_id
+                    if session_video.video_id not in self.current_session.posted_videos:
+                        self.current_session.posted_videos.append(session_video.video_id)
+                elif status == "downloading":
+                    existing_sv.status = VideoStatus.PENDING
+                    existing_sv.download_attempts = video.download_attempts
+                elif status == "downloaded":
+                    existing_sv.status = VideoStatus.PENDING  # Ready to post
+                elif status == "failed":
+                    existing_sv.status = VideoStatus.FAILED
+                    existing_sv.error_message = error_message
+                    existing_sv.retry_count = video.download_attempts
+                    if session_video.video_id not in self.current_session.failed_videos:
+                        self.current_session.failed_videos.append(session_video.video_id)
+
+                self.session_manager.save_session(self.current_session)
+        except Exception as e:
+            self.logger.error(f"Failed to sync video status to session: {e}")
 
     def get_queue_status(self) -> Dict[str, Any]:
         """Get queue statistics."""
@@ -1117,8 +1152,9 @@ class CreatorSyncManager:
                 video.content_id = None
         else:
             self.videos = []
-        if self._should_save():
-            self._save_queue()
+        # Sync changes to session file
+        if self.session_manager and self.current_session:
+            self._sync_videos_to_session(self.videos, "unknown")
 
     def reset_queue(self):
         """Reset the queue - all videos become pending."""
@@ -1126,8 +1162,9 @@ class CreatorSyncManager:
             video.status = "pending"
             video.posted_at = None
             video.content_id = None
-        if self._should_save():
-            self._save_queue()
+        # Sync changes to session file
+        if self.session_manager and self.current_session:
+            self._sync_videos_to_session(self.videos, "unknown")
 
     def print_queue_summary(self):
         """Print a summary of the video queue."""

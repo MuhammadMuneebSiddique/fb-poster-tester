@@ -9,7 +9,7 @@ All session state is persisted to disk and survives process crashes, restarts, a
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime as dt_datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -89,6 +89,7 @@ class SessionVideo:
             "title": self.title,
             "page_id": self.session_id[:20] if self.session_id else None,  # Will be set by page_id
             "session_id": self.session_id,
+            "video_id": self.video_id,  # Page-scoped video identifier
             "source_video_id": self.source_video_id,
             "platform": self.platform,
             "upload_date": self.upload_date,
@@ -186,6 +187,7 @@ class CreatorSession:
     last_post_time: Optional[str] = None
     resume_point: int = 0             # Where to resume after crash
     total_videos: int = 0
+    selected_video_count: int = 0     # How many videos user selected for posting (0 = all/ask)
     timezone: str = "Asia/Karachi"    # Default posting timezone
 
     def to_dict(self) -> Dict[str, Any]:
@@ -209,6 +211,7 @@ class CreatorSession:
             "last_post_time": self.last_post_time,
             "resume_point": self.resume_point,
             "total_videos": self.total_videos,
+            "selected_video_count": self.selected_video_count,
             "timezone": self.timezone,
         }
 
@@ -239,6 +242,7 @@ class CreatorSession:
             last_post_time=data.get("last_post_time"),
             resume_point=data.get("resume_point", 0),
             total_videos=data.get("total_videos", 0),
+            selected_video_count=data.get("selected_video_count", 0),
             timezone=data.get("timezone", "Asia/Karachi"),
         )
         # Load videos
@@ -359,7 +363,7 @@ class SessionManager:
 
         try:
             # Mark the save in progress
-            session.last_update_time = datetime.now().isoformat()
+            session.last_update_time = dt_datetime.now().isoformat()
 
             logger.info(f"[SESSION] Saving session {session.session_id} for page {session.page_id}: {len(session.videos)} videos, status={session.status.value}")
 
@@ -438,8 +442,8 @@ class SessionManager:
             session_id=str(uuid.uuid4())[:12],
             creator_name=creator_name,
             status=SessionStatus.SETUP,
-            session_created_time=datetime.now().isoformat(),
-            last_update_time=datetime.now().isoformat(),
+            session_created_time=dt_datetime.now().isoformat(),
+            last_update_time=dt_datetime.now().isoformat(),
         )
         return session
 
@@ -479,7 +483,7 @@ class SessionManager:
             return False
 
         video.status = status
-        video.last_update_time = datetime.now().isoformat()
+        video.last_update_time = dt_datetime.now().isoformat()
 
         if save:
             return self.save_session(session)
@@ -497,7 +501,7 @@ class SessionManager:
 
         video.status = VideoStatus.PROCESSING
         video.download_attempts += 1
-        video.last_update_time = datetime.now().isoformat()
+        video.last_update_time = dt_datetime.now().isoformat()
         return self.save_session(session)
 
     def mark_video_posted(self, video_id: str, content_id: str = None) -> bool:
@@ -512,7 +516,7 @@ class SessionManager:
 
         video.status = VideoStatus.POSTED
         video.content_id = content_id
-        video.posted_at = datetime.now().isoformat()
+        video.posted_at = dt_datetime.now().isoformat()
         video.last_update_time = video.posted_at
 
         # Update session-level tracking
@@ -542,7 +546,7 @@ class SessionManager:
             session.failed_videos.append(video.video_id)
         session.current_progress = len(session.posted_videos) + session.get_pending_count() + session.get_processing_count() + session.get_failed_count()
         session.resume_point = session.current_progress
-        session.last_update_time = datetime.now().isoformat()
+        session.last_update_time = dt_datetime.now().isoformat()
 
         return self.save_session(session)
 
@@ -563,7 +567,7 @@ class SessionManager:
 
         video.status = VideoStatus.POSTED
         video.content_id = content_id
-        video.posted_at = datetime.now().isoformat()
+        video.posted_at = dt_datetime.now().isoformat()
         video.last_update_time = video.posted_at
 
         # Update session-level tracking
@@ -596,7 +600,7 @@ class SessionManager:
 
         video.status = VideoStatus.FAILED
         video.error_message = error_message
-        video.last_update_time = datetime.now().isoformat()
+        video.last_update_time = dt_datetime.now().isoformat()
 
         # Update session-level tracking
         if video.video_id not in session.failed_videos:
@@ -638,7 +642,7 @@ class SessionManager:
             video.retry_count = 0
             video.error_message = ""
         video.download_attempts = 0
-        video.last_update_time = datetime.now().isoformat()
+        video.last_update_time = dt_datetime.now().isoformat()
         video.posted_at = None
         video.content_id = None
 
@@ -674,7 +678,7 @@ class SessionManager:
         video.download_attempts += 1
         if increment_retry:
             video.retry_count += 1
-        video.last_update_time = datetime.now().isoformat()
+        video.last_update_time = dt_datetime.now().isoformat()
 
         return self.save_session(session)
 

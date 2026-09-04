@@ -366,9 +366,7 @@ class FacebookAutoPoster:
             )
 
             # NEW: Initialize creator sync manager
-            queue_file = os.environ.get("CREATOR_QUEUE_FILE", "content/creator_queue.json")
             self.creator_sync_manager = CreatorSyncManager(
-                queue_file=queue_file,
                 logger=self.logger,
                 use_cookies_file=True,
                 cookies_file=cookies_file
@@ -1278,7 +1276,8 @@ class FacebookAutoPoster:
                 'upload_date': v.upload_date,
                 'timestamp': v.timestamp,
                 'source_video_id': v.source_video_id,
-                'platform': v.platform
+                'platform': v.platform,
+                'video_id': v.video_id
             } for v in all_videos if v.status == "pending" or v.status not in ["posted", "failed"]],
             scheduled_times=scheduled_times,
             session_id=session_id,
@@ -1374,7 +1373,8 @@ class FacebookAutoPoster:
                 'upload_date': v.upload_date,
                 'timestamp': v.timestamp,
                 'source_video_id': v.source_video_id,
-                'platform': v.platform
+                'platform': v.platform,
+                'video_id': v.video_id
             } for v in all_videos],
             scheduled_times=scheduled_times,
             session_id=session_id,
@@ -1399,11 +1399,13 @@ class FacebookAutoPoster:
         console.print()
         console.print(Rule(style="green"))
         console.print()
+        # Get total videos from session, not global posting queue
+        total_videos = self.creator_sync_manager.current_session.total_videos if self.creator_sync_manager.current_session else 0
         console.print(Panel(
             Text.assemble(
                 (f"{ICONS['rocket']} Content Creator Auto Poster Started\n", "green"),
                 (f"Creator: {self.creator_sync_manager.creator_name}\n", "cyan"),
-                (f"Total Videos: {self.posting_queue.get_stats()['total']}\n", "yellow"),
+                (f"Total Videos: {total_videos}\n", "yellow"),
                 (f"Posting Times: {', '.join(scheduled_times)} PKT daily\n", "green"),
                 (f"Re-sync: Daily at 00:05 PKT", "dim"),
             ),
@@ -1412,7 +1414,7 @@ class FacebookAutoPoster:
         ))
 
         # Start scheduler
-        console.print(f"[cyan]{ICONS['cog']} Starting scheduler...[/cyan]")
+        console.print(f"[cyan]{ICONS['cog']} Starting scheduler (run_creator_mode)...[/cyan]")
         self.scheduler_manager.start()
 
         console.print()
@@ -1533,18 +1535,26 @@ class FacebookAutoPoster:
         session.posting_schedule = scheduled_times
         session.creator_url = self.creator_sync_manager.creator_url or self._creator_url or ""
 
-        # Save session to disk
+        # Check if we need to ask user for video count selection
+        # Only ask once for this session - selected_video_count == 0 means not yet asked
+        if session.selected_video_count == 0:
+            from src.ui.prompts import PromptUI
+            selected_count = PromptUI.ask_video_count_for_profile(len(session.videos))
+            session.selected_video_count = selected_count
+            self.logger.info(f"[SESSION] User selected {selected_count} videos for posting")
+
+        # Save the updated session with the selection
         self.creator_sync_manager.session_manager.save_session(session)
-        self.logger.info(f"[SESSION] Saved session with {session.total_videos} videos")
+        self.logger.info(f"[SESSION] Saved session with {session.total_videos} videos, {session.selected_video_count} selected")
         self.logger.info(f"[SESSION] Saved posting_schedule: {scheduled_times}")
         self.logger.info(f"[SESSION] Saved creator_url: {session.creator_url[:50] if session.creator_url else 'None'}...")
 
-        # Step 2: Add videos to posting queue
+        # Step 2: Add videos to posting queue (only the selected count)
         console.print()
         console.print(f"[cyan]{ICONS['calendar']} Adding videos to posting queue...[/cyan]")
 
-        # Add videos with page-scoped queue items
-        all_videos = self.creator_sync_manager.list_videos()
+        # Add videos with page-scoped queue items - only the selected number
+        all_videos = session.videos[:session.selected_video_count]  # Only select first N videos (chronological order)
         session_id = session.session_id if session else None
         added_items = []
         for i, v in enumerate(all_videos):
@@ -1558,6 +1568,7 @@ class FacebookAutoPoster:
                 scheduled_time=scheduled_time,
                 page_id=page_id,
                 session_id=session_id,
+                video_id=v.video_id,
                 source_video_id=v.source_video_id,
                 platform=v.platform
             )
@@ -1581,11 +1592,13 @@ class FacebookAutoPoster:
         console.print()
         console.print(Rule(style="green"))
         console.print()
+        # Get total videos from session, not global posting queue
+        total_videos = self.creator_sync_manager.current_session.total_videos if self.creator_sync_manager.current_session else 0
         console.print(Panel(
             Text.assemble(
                 (f"{ICONS['rocket']} Content Creator Auto Poster Started\n", "green"),
                 (f"Creator: {self.creator_sync_manager.creator_name}\n", "cyan"),
-                (f"Total Videos: {self.posting_queue.get_stats()['total']}\n", "yellow"),
+                (f"Total Videos: {total_videos}\n", "yellow"),
                 (f"Posting Times: {', '.join(scheduled_times)} PKT daily\n", "green"),
                 (f"Re-sync: Daily at 00:05 PKT", "dim"),
             ),
@@ -1651,6 +1664,9 @@ class FacebookAutoPoster:
 
         Gets next pending video from queue, downloads it, and posts to Facebook.
 
+        Implements retry logic: if download fails, retries up to 3 times within
+        the same job execution before marking as FAILED.
+
         Args:
             job_id: Job identifier
             scheduled_time: The scheduled time string (HH:MM)
@@ -1659,11 +1675,12 @@ class FacebookAutoPoster:
         console.print()
         Messages.print_scheduled_post_header(job_id, "")
 
-        # Get next pending item from queue
-        item = self.posting_queue.get_next_pending()
+        # Get next pending item from queue, filtered by current session
+        session_id = self.creator_sync_manager.current_session.session_id if self.creator_sync_manager and self.creator_sync_manager.current_session else None
+        item = self.posting_queue.get_next_pending(session_id=session_id)
 
         if not item:
-            # Queue is empty
+            # Queue is empty for this session
             console.print(f"[info]{ICONS['info']} Queue is empty - all videos have been posted![/info]")
             self._check_completion()
             return
@@ -1672,158 +1689,152 @@ class FacebookAutoPoster:
         console.print(f"[info]{ICONS['info']} Queue Order: {item.scheduled_order}[/info]")
         console.print(f"[info]{ICONS['info']} Scheduled Time: {item.scheduled_time or scheduled_time} PKT[/info]")
 
-        try:
-            # Mark as downloading
-            self.posting_queue.mark_as_downloading(item.id)
+        # === DOWNLOAD WITH RETRY LOOP ===
+        max_download_attempts = 3
+        download_success = False
+        content = None
 
-            # Update session status - mark as processing for crash recovery
-            # Track download attempts: first attempt is 1, retries increment from there
-            if self.creator_sync_manager and self.creator_sync_manager.current_session:
-                session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
-                    item.source_video_id or "", item.platform or ""
-                )
-                if session_video:
-                    # Increment download attempts for this attempt
-                    session_video.download_attempts += 1
-                    # Sync retry_count with download_attempts
-                    session_video.retry_count = session_video.download_attempts
-                    session_video.status = VideoStatus.PROCESSING
-                    self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
-                    self.logger.info(f"[SESSION] Video {session_video.video_id} marked PROCESSING (attempt {session_video.retry_count}/3)")
-                    self.logger.info(f"[SESSION] Saving session: {self.creator_sync_manager.current_session.total_videos} total, {len(self.creator_sync_manager.current_session.posted_videos)} posted, {self.creator_sync_manager.current_session.get_pending_count()} pending")
+        while item.status == "pending" and item.retry_count < max_download_attempts:
+            try:
+                # Mark as downloading
+                self.posting_queue.mark_as_downloading(item.id)
 
-            # Determine current attempt number for display
-            # retry_count tracks the number of previous failures (0, 1, 2)
-            # Current attempt = retry_count + 1 (so 1, 2, 3)
-            attempt_num = getattr(item, 'retry_count', 0) + 1
-
-            # Download video
-            console.print(f"\n[cyan]{ICONS['download']} Downloading video...[/cyan]")
-            console.print(f"[info]{ICONS['clock']} Download attempt {attempt_num}/3[/info]")
-            self.logger.info(f"Downloading video for creator job: {item.video_url} (attempt {attempt_num}/3)")
-
-            downloaded_contents = self.video_downloader.download_multiple([item.video_url])
-
-            if not downloaded_contents:
-                Messages.print_download_failed("Could not download video")
-                self._handle_download_failure(item)
-                return
-
-            content = downloaded_contents[0]
-
-            if content.status == DownloadStatus.FAILED:
-                Messages.print_download_failed(content.error_message)
-                self._handle_download_failure(item)
-                return
-
-            Messages.print_download_complete(content.title, str(content.file_path))
-
-            # Validate that the downloaded file matches the queued video ID
-            import re
-            queued_video_id = item.video_url.split('/video/')[-1].split('?')[0] if '/video/' in item.video_url else None
-            downloaded_video_id = content.file_path.stem if content.file_path else None
-
-            if queued_video_id and downloaded_video_id and queued_video_id != downloaded_video_id:
-                Messages.print_wrong_video_error(
-                    f"Video ID mismatch: queue has '{queued_video_id}' but downloaded file has '{downloaded_video_id}'"
-                )
-                self._handle_download_failure(item)
-                return
-
-            # Add to content manager
-            content_type = ContentType.VIDEO if content.mime_type.startswith('video/') else ContentType.IMAGE
-
-            metadata = {
-                'title': content.title,
-                'description': content.description or "",
-                'source_url': content.original_url,
-                'platform': content.platform.value,
-                'downloaded_at': content.downloaded_at,
-                'duration': content.duration,
-                'uploader': content.metadata.get('uploader', ''),
-            }
-
-            console.print(f"\n[cyan]{ICONS['cog']} Adding to Content Manager...[/cyan]")
-
-            # Prepare message with hashtags
-            base_message = content.description[:500] if content.description else ""
-            message_with_hashtags = append_hashtags(base_message, count=10)
-
-            content_item = self.content_manager.add_content(
-                file_path=content.file_path,
-                content_type=content_type,
-                title=content.title,
-                message=message_with_hashtags,
-                metadata=metadata
-            )
-
-            if not content_item:
-                Messages.print_no_content_message()
-                self._handle_download_failure(item)
-                return
-
-            Messages.print_content_added(content_item.id, content.title)
-
-            # Post to Facebook
-            console.print()
-            Messages.print_posting_started()
-
-            console.print(f"[cyan]{ICONS['link']} Posting to Facebook...[/cyan]")
-            success = self.facebook_poster.post_content(content_item.id)
-
-            if success:
-                # Mark as posted
-                self.posting_queue.mark_as_posted(item.id, content_item.id)
-
-                # Update session status for page-scoped persistence
+                # Update session status - mark as processing for crash recovery
                 if self.creator_sync_manager and self.creator_sync_manager.current_session:
-                    # Find video by source_video_id and update its status
-                    self.creator_sync_manager.session_manager.mark_video_posted_by_source(
-                        item.source_video_id or "",
-                        content_id=content_item.id,
-                        platform=item.platform or ""
+                    session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                        item.source_video_id or "", item.platform or ""
                     )
-                    self.logger.info(f"[SESSION] Updated video status to POSTED in session for {item.title}")
+                    if session_video:
+                        # Increment download attempts for this attempt
+                        session_video.download_attempts += 1
+                        session_video.retry_count = session_video.download_attempts
+                        session_video.status = VideoStatus.PROCESSING
+                        self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                        self.logger.info(f"[SESSION] Video {session_video.video_id} marked PROCESSING (attempt {session_video.retry_count}/3)")
 
-                self.logger.info(f"Successfully posted: {item.title}")
-                Messages.print_post_success(content.title)
+                # Determine current attempt number
+                attempt_num = getattr(item, 'retry_count', 0) + 1
 
-                # Show queue status
-                self._show_queue_status()
-            else:
-                # Handle post failure
-                self._handle_post_failure(item, "Failed to post to Facebook")
+                # Download video
+                console.print(f"\n[cyan]{ICONS['download']} Downloading video...[/cyan]")
+                console.print(f"[info]{ICONS['clock']} Download attempt {attempt_num}/3[/info]")
+                self.logger.info(f"Downloading video for creator job: {item.video_url} (attempt {attempt_num}/3)")
 
-                # Update session status for page-scoped persistence
-                if self.creator_sync_manager and self.creator_sync_manager.current_session:
-                    self.creator_sync_manager.session_manager.mark_video_failed_by_source(
-                        item.source_video_id or "",
-                        error_message="Failed to post to Facebook",
-                        platform=item.platform or ""
+                downloaded_contents = self.video_downloader.download_multiple([item.video_url])
+
+                if not downloaded_contents:
+                    Messages.print_download_failed("Could not download video")
+                    self._handle_download_failure(item)
+                    continue  # Retry loop - will check retry_count < 3
+
+                content = downloaded_contents[0]
+
+                if content.status == DownloadStatus.FAILED:
+                    Messages.print_download_failed(content.error_message)
+                    self._handle_download_failure(item)
+                    continue  # Retry loop
+
+                # Validate that the downloaded file matches the queued video ID
+                # (check URL video ID matches downloaded file stem)
+                queued_video_id = item.video_url.split('/video/')[-1].split('?')[0] if '/video/' in item.video_url else None
+                downloaded_video_id = content.file_path.stem if content.file_path else None
+
+                if queued_video_id and downloaded_video_id and queued_video_id != downloaded_video_id:
+                    Messages.print_wrong_video_error(
+                        f"Video ID mismatch: queue has '{queued_video_id}' but downloaded file has '{downloaded_video_id}'"
                     )
-                    self.logger.info(f"[SESSION] Updated video status to FAILED in session for {item.title}")
+                    self._handle_download_failure(item)
+                    continue  # Retry loop
 
-        except Exception as e:
-            self.logger.error(f"Job {job_id} execution error: {e}", exc_info=True)
-            console.print(f"[error]{ICONS['x']} ERROR: {e}[/error]")
-            if 'item' in dir() and item and hasattr(item, 'retry_count'):
-                # Handle exception with retry logic for download errors
-                import time
+                # Download succeeded
+                download_success = True
+                Messages.print_download_complete(content.title, str(content.file_path))
 
-                # Increment retry count for tracking
-                item.retry_count += 1
-                retry_attempt = item.retry_count
+                # === ADD TO CONTENT MANAGER ===
+                console.print(f"\n[cyan]{ICONS['cog']} Adding to Content Manager...[/cyan]")
 
-                # Log the retry attempt
-                console.print(f"[warning]{ICONS['warning']} Download attempt {retry_attempt}/3 failed due to error[/warning]")
-                self.logger.info(f"Download attempt {retry_attempt}/3 failed for: {item.title} - Error: {str(e)[:100]}")
+                # Add to content manager
+                content_type = ContentType.VIDEO if content.mime_type.startswith('video/') else ContentType.IMAGE
 
-                if retry_attempt < 3:
-                    # Not all attempts exhausted - reset to pending for retry
-                    item.status = "pending"
+                metadata = {
+                    'title': content.title,
+                    'description': content.description or "",
+                    'source_url': content.original_url,
+                    'platform': content.platform.value,
+                    'downloaded_at': content.downloaded_at,
+                    'duration': content.duration,
+                    'uploader': content.metadata.get('uploader', ''),
+                }
+
+                # Prepare message with hashtags
+                base_message = content.description[:500] if content.description else ""
+                message_with_hashtags = append_hashtags(base_message, count=10) if base_message else ""
+
+                content_item = self.content_manager.add_content(
+                    file_path=content.file_path,
+                    content_type=content_type,
+                    title=content.title,
+                    message=message_with_hashtags,
+                    metadata=metadata
+                )
+
+                if not content_item:
+                    Messages.print_no_content_message()
+                    self._handle_download_failure(item)
+                    continue  # Retry loop
+
+                Messages.print_content_added(content_item.id, content.title)
+
+                # Post to Facebook
+                console.print()
+                Messages.print_posting_started()
+
+                console.print(f"[cyan]{ICONS['link']} Posting to Facebook...[/cyan]")
+                success = self.facebook_poster.post_content(content_item.id)
+
+                if success:
+                    # Mark as posted
+                    self.posting_queue.mark_as_posted(item.id, content_item.id)
+
+                    # Update session status for page-scoped persistence
+                    if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                        # Find video by source_video_id and update its status
+                        self.creator_sync_manager.session_manager.mark_video_posted_by_source(
+                            item.source_video_id or "",
+                            content_id=content_item.id,
+                            platform=item.platform or ""
+                        )
+                        self.logger.info(f"[SESSION] Updated video status to POSTED in session for {item.title}")
+
+                    self.logger.info(f"Successfully posted: {item.title}")
+                    Messages.print_post_success(content.title)
+
+                    # Show queue status
+                    self._show_queue_status()
+                    break  # Success - exit retry loop
+
+                else:
+                    console.print(f"[error]{ICONS['x']} Failed to post to Facebook - marking as FAILED[/error]")
+                    self._handle_post_failure(item, "Failed to post to Facebook")
+
+                    # Update session status for page-scoped persistence
+                    if self.creator_sync_manager and self.creator_sync_manager.current_session:
+                        self.creator_sync_manager.session_manager.mark_video_failed_by_source(
+                            item.source_video_id or "",
+                            error_message="Failed to post to Facebook",
+                            platform=item.platform or ""
+                        )
+                        self.logger.info(f"[SESSION] Updated video status to FAILED in session for {item.title}")
+
+                    self._show_queue_status()
+                    break  # Facebook post failure - no retry
+
+            except Exception as e:
+                self.logger.error(f"Download failed with exception: {e}", exc_info=True)
+                console.print(f"[error]{ICONS['x']} ERROR: {e}[/error]")
+                if item and hasattr(item, 'retry_count'):
+                    item.retry_count += 1
                     item.error_message = str(e)
-
-                    # Update session status
                     if self.creator_sync_manager and self.creator_sync_manager.current_session:
                         session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
                             item.source_video_id or "", item.platform or ""
@@ -1833,45 +1844,22 @@ class FacebookAutoPoster:
                             session_video.retry_count = item.retry_count
                             session_video.download_attempts = item.retry_count
                             session_video.error_message = str(e)
-                            session_video.last_update_time = dt_datetime.now().isoformat()
-                            if session_video.video_id in self.creator_sync_manager.current_session.failed_videos:
-                                self.creator_sync_manager.current_session.failed_videos.remove(session_video.video_id)
                             self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
-                            self.logger.info(f"[SESSION] Video {session_video.video_id} reset to PENDING (attempt {retry_attempt}/3)")
+                    self._handle_download_failure(item)  # This handles the PENDING reset and delay
+                continue  # Retry loop
 
-                    # Small delay before next retry
-                    console.print(f"[info]{ICONS['clock']} Waiting 2 seconds before retry...[/info]")
-                    time.sleep(2)
-                else:
-                    # All 3 attempts failed - mark as FAILED
-                    console.print(f"[error]{ICONS['x']} All 3 attempts failed → Marking video as FAILED[/error]")
-                    self.logger.warning(f"All 3 download attempts failed for: {item.title} - Final error: {str(e)[:200]}")
-
-                    item.status = "failed"
-                    item.error_message = str(e)
-
-                    # Update session status - mark as FAILED with error message
-                    if self.creator_sync_manager and self.creator_sync_manager.current_session:
-                        session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
-                            item.source_video_id or "", item.platform or ""
-                        )
-                        if session_video:
-                            session_video.status = VideoStatus.FAILED
-                            session_video.download_attempts = item.retry_count
-                            session_video.error_message = str(e)
-                            session_video.last_update_time = dt_datetime.now().isoformat()
-                            if session_video.video_id not in self.creator_sync_manager.current_session.failed_videos:
-                                self.creator_sync_manager.current_session.failed_videos.append(session_video.video_id)
-                            self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
-                            self.logger.info(f"[SESSION] Video {session_video.video_id} marked FAILED (attempt 3/3) - Reason: {str(e)[:200]}")
-                        else:
-                            # Video not in session - just mark item as failed
-                            pass
-
-                    self._show_queue_status()
+        # Check if all retries exhausted (after the while loop)
+        if not download_success:
+            if item.retry_count >= max_download_attempts:
+                console.print(f"[error]{ICONS['x']} All {max_download_attempts} download attempts failed[/error]")
             else:
-                # Item might be None or invalid, log and continue
-                self.logger.warning(f"Could not update queue for failed job {job_id}")
+                console.print(f"[warning]{ICONS['warning']} Download queue exhausted - video will not be retried[/warning]")
+            self._show_queue_status()
+            return
+
+    def _execute_standalone_job(self, job_id: str, scheduled_time: str):
+        """Wrapper for backward compatibility - calls the main job execution."""
+        pass
 
     def _handle_download_failure(self, item: 'QueueItem', error_message: str = "Download failed"):
         """
@@ -2057,6 +2045,7 @@ class FacebookAutoPoster:
                                 scheduled_time=scheduled_time,
                                 page_id=page_id,
                                 session_id=session_id,
+                                video_id=video.video_id,
                                 source_video_id=video.source_video_id,
                                 platform=video.platform
                             )
@@ -2070,24 +2059,50 @@ class FacebookAutoPoster:
                     console.print(f"[info]{ICONS['info']} Added {len(new_videos)} new videos to queue (no scheduled times)[/info]")
 
     def _show_queue_status(self):
-        """Show current queue status."""
-        stats = self.posting_queue.get_stats()
-        remaining = stats['pending'] + stats['downloading']
+        """Show current queue status for Creator Mode from session, not global posting queue."""
+        if self._is_creator_mode and self.creator_sync_manager and self.creator_sync_manager.current_session:
+            # Use session stats for Creator Mode
+            session = self.creator_sync_manager.current_session
+            pending = session.get_pending_count()
+            posted = session.get_posted_count()
+            failed = session.get_failed_count()
+            total = session.total_videos
+            remaining = pending + session.get_processing_count()
 
-        if remaining > 0:
-            console.print(f"[info]{ICONS['info']} Queue Status: {stats['pending']} pending, {stats['posted']} posted, {stats['failed']} failed[/info]")
+            if remaining > 0:
+                console.print(f"[info]{ICONS['info']} Queue Status: {pending} pending, {posted} posted, {failed} failed[/info]")
+            else:
+                console.print(f"[success]{ICONS['check']} All {total} videos have been posted![/success]")
         else:
-            console.print(f"[success]{ICONS['check']} All {stats['total']} videos have been posted![/success]")
+            # Use global posting queue stats for non-Creator Mode
+            stats = self.posting_queue.get_stats()
+            remaining = stats['pending'] + stats['downloading']
+
+            if remaining > 0:
+                console.print(f"[info]{ICONS['info']} Queue Status: {stats['pending']} pending, {stats['posted']} posted, {stats['failed']} failed[/info]")
+            else:
+                console.print(f"[success]{ICONS['check']} All {stats['total']} videos have been posted![/success]")
 
     def _check_completion(self):
         """Check if all videos are posted and exit if so."""
-        stats = self.posting_queue.get_stats()
-
-        if stats['pending'] == 0 and stats['downloading'] == 0 and stats['total'] > 0:
+        if self._is_creator_mode and self.creator_sync_manager and self.creator_sync_manager.current_session:
+            # Use session stats for Creator Mode
+            session = self.creator_sync_manager.current_session
+            pending = session.get_pending_count()
+            processing = session.get_processing_count()
+            total = session.total_videos
+            posted = session.get_posted_count()
+            failed = session.get_failed_count()
+        else:
+            # Use global posting queue stats for non-Creator Mode
+            stats = self.posting_queue.get_stats()
+            pending = stats['pending']
+            processing = stats['downloading']
             total = stats['total']
             posted = stats['posted']
             failed = stats['failed']
 
+        if pending == 0 and processing == 0 and total > 0:
             console.print()
             console.print(Rule(style="green"))
             console.print()
@@ -2413,10 +2428,10 @@ class FacebookAutoPoster:
             "facebook_connected": self.facebook_client is not None and self.facebook_client.test_connection(),
         }
 
-        # Add creator sync status
+        # Add creator session status
         if self.creator_sync_manager:
             creator_status = self.creator_sync_manager.get_queue_status()
-            status["creator_queue"] = creator_status
+            status["creator_session"] = creator_status
 
         return status
 
@@ -2675,7 +2690,12 @@ class FacebookAutoPoster:
         """
         Reset (clear) the session for a specific page.
 
-        This creates a fresh start, losing all posted statistics.
+        This creates a completely fresh session, discarding ALL previous data:
+        - All videos (pending, posted, failed)
+        - All retry counts and progress state
+        - Old session_id (new one generated)
+        - Old timestamps (new ones will be set on next sync)
+
         Use when starting a completely new profile sync.
 
         Args:
@@ -2684,14 +2704,47 @@ class FacebookAutoPoster:
         Returns:
             True if reset successful
         """
-        if self.creator_sync_manager:
-            # Reset the session status but keep the queue
-            if self.creator_sync_manager.current_session:
-                self.creator_sync_manager.current_session.status = SessionStatus.SETUP
-                self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
-            console.print(f"[success]{ICONS['check']} Session reset for Page {page_id}[/success]")
-            return True
-        return False
+        if not self.creator_sync_manager:
+            console.print(f"[error]{ICONS['x']} No creator sync manager available[/error]")
+            return False
+
+        # Store page_id and creator info for creating new session
+        stored_page_id = page_id
+        stored_creator_url = self.creator_sync_manager.creator_url or ""
+        stored_creator_name = self.creator_sync_manager.creator_name or "New Creator"
+
+        # Delete the old session file to ensure clean slate
+        self.creator_sync_manager.session_manager.delete_session()
+        console.print(f"[info]{ICONS['info']} Deleted old session file for page {page_id}[/info]")
+
+        # Clear in-memory video lists
+        old_video_count = len(self.creator_sync_manager.videos) if self.creator_sync_manager.videos else 0
+        self.creator_sync_manager.videos = []
+        console.print(f"[info]{ICONS['info']} Cleared {old_video_count} videos from memory[/info]")
+
+        # Create a NEW clean session (not just resetting status on old session)
+        new_session = self.creator_sync_manager.session_manager.create_new_session(
+            creator_url=stored_creator_url,
+            creator_name=stored_creator_name,
+            platform="tiktok",  # Default platform, will be updated on next sync
+            page_id=stored_page_id
+        )
+
+        # Set the new session in the sync manager
+        self.creator_sync_manager.current_session = new_session
+        console.print(f"[info]{ICONS['info']} Created new clean session: {new_session.session_id}[/info]")
+
+        # Save the new session to disk immediately
+        self.creator_sync_manager.session_manager.save_session(new_session)
+        console.print(f"[info]{ICONS['info']} Saved new session to disk[/info]")
+
+        # Clear creator_url and creator_name to force re-entry on next sync
+        self.creator_sync_manager.creator_url = ""
+        self.creator_sync_manager.creator_name = ""
+
+        console.print(f"[success]{ICONS['check']} Session reset for Page {page_id}[/success]")
+        console.print(f"[info]{ICONS['info']} Please run profile sync to discover new videos.[/info]")
+        return True
 
     def run_continue_posting(self, page_id: str, keep_schedule: bool = True):
         """
@@ -2786,15 +2839,22 @@ class FacebookAutoPoster:
             console.print(f"[warning]{ICONS['warning']} Session has {session.total_videos} total videos but videos list is empty - recovering from posting queue[/warning]")
             self.logger.info(f"[RESUME] Recovering videos from posting queue for {session.total_videos} videos")
 
-            # Load all items from posting queue (not just pending - include all statuses)
+            # Load items from posting queue belonging to THIS session only
+            # This ensures strict session isolation and prevents loading items from other sessions
             from src.creator.session import VideoStatus as SessionVideoStatus
-            queue_items = [item for item in self.posting_queue.items if item.video_id in session.queue_order or not session.queue_order]
+            queue_items = [item for item in self.posting_queue.items
+                         if item.session_id == session.session_id
+                         and (item.video_id in session.queue_order or not session.queue_order)]
 
             for item in queue_items:
                 if item.source_video_id:
-                    video_id = self.creator_sync_manager.session_manager.generate_video_id(
-                        item.platform or "youtube", item.source_video_id
-                    )
+                    # Use the video_id from queue item if available, otherwise generate it
+                    if item.video_id:
+                        video_id = item.video_id
+                    else:
+                        video_id = self.creator_sync_manager.session_manager.generate_video_id(
+                            item.platform or "youtube", item.source_video_id
+                        )
 
                     from src.creator.session import SessionVideo
                     sv = SessionVideo(
@@ -2897,6 +2957,7 @@ class FacebookAutoPoster:
                     scheduled_time=scheduled_time,
                     page_id=page_id,
                     session_id=session.session_id,
+                    video_id=video.video_id,
                     source_video_id=video.source_video_id,
                     platform=video.platform
                 )

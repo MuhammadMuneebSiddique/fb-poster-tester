@@ -37,6 +37,7 @@ class QueueItem:
     title: str
     page_id: Optional[str] = None  # Page-scoped video ID for multi-page isolation
     session_id: Optional[str] = None  # Creator session this item belongs to
+    video_id: Optional[str] = None  # Page-scoped video identifier (page_id + platform + source_video_id hash)
     source_video_id: Optional[str] = None  # Platform-specific video ID (YouTube video ID, TikTok aweme ID, etc.)
     platform: Optional[str] = None  # youtube, tiktok, instagram
     upload_date: Optional[str] = None
@@ -56,6 +57,7 @@ class QueueItem:
             "title": self.title,
             "page_id": self.page_id,
             "session_id": self.session_id,
+            "video_id": self.video_id,
             "source_video_id": self.source_video_id,
             "platform": self.platform,
             "upload_date": self.upload_date,
@@ -77,6 +79,7 @@ class QueueItem:
             title=data.get("title", ""),
             page_id=data.get("page_id"),
             session_id=data.get("session_id"),
+            video_id=data.get("video_id"),
             source_video_id=data.get("source_video_id"),
             platform=data.get("platform"),
             upload_date=data.get("upload_date"),
@@ -172,13 +175,22 @@ class PostQueue:
         # Use provided page_id or fall back to instance page_id
         item_page_id = page_id if page_id is not None else self.page_id
 
-        # Generate a unique ID - use video_id if provided (page-scoped), otherwise hash from URL
+        # Generate a unique queue item ID (for queue entry tracking)
+        # Use provided video_id as the queue item id if provided, otherwise hash from URL
         if video_id:
             item_id = video_id
         else:
-            # Combine page_id with URL for page-scoped ID generation
+            # Generate a unique queue item ID
             id_source = f"{item_page_id}:{video_url}" if item_page_id else video_url
             item_id = f"queue_{hashlib.md5(id_source.encode()).hexdigest()[:12]}"
+
+        # Generate video_id (page-scoped video identifier) if not provided
+        # video_id = page_id:platform:source_video_id hash for proper session matching
+        item_video_id = video_id
+        if not item_video_id and item_page_id and source_video_id and platform:
+            # Generate page-scoped video_id from page_id + platform + source_video_id
+            video_id_source = f"{item_page_id}:{platform}:{source_video_id}"
+            item_video_id = hashlib.md5(video_id_source.encode()).hexdigest()[:16]
 
         # Get next sequence number
         order = self.next_id
@@ -189,6 +201,7 @@ class PostQueue:
             title=title,
             page_id=item_page_id,
             session_id=session_id,
+            video_id=item_video_id,  # Page-scoped video identifier (for session matching)
             source_video_id=source_video_id,
             platform=platform,
             upload_date=upload_date,
@@ -256,6 +269,7 @@ class PostQueue:
                 scheduled_time=scheduled_time,
                 source_video_id=video.get('source_video_id'),
                 platform=video.get('platform'),
+                video_id=video.get('video_id'),
                 session_id=session_id,
                 page_id=page_id,
             )
@@ -263,14 +277,25 @@ class PostQueue:
 
         return created_items
 
-    def get_next_pending(self) -> Optional[QueueItem]:
+    def get_next_pending(self, session_id: Optional[str] = None) -> Optional[QueueItem]:
         """
         Get the next pending item in the queue (by scheduled_order).
 
         If page_id is set on the queue, only returns items for that page.
-        This ensures strict multi-page isolation.
+        If session_id is provided, only returns items for that session.
+        This ensures strict multi-page and multi-session isolation.
+
+        Args:
+            session_id: Optional session ID to filter by (creator mode)
         """
-        if self.page_id:
+        if self.page_id and session_id:
+            # Filter by both page_id and session_id (creator mode)
+            pending = [item for item in self.items
+                       if item.status == "pending"
+                       and item.page_id == self.page_id
+                       and item.session_id == session_id]
+        elif self.page_id:
+            # Filter by page_id only (non-creator mode)
             pending = [item for item in self.items
                        if item.status == "pending" and item.page_id == self.page_id]
         else:
@@ -278,14 +303,25 @@ class PostQueue:
         pending.sort(key=lambda x: x.scheduled_order)
         return pending[0] if pending else None
 
-    def get_pending_items(self) -> List[QueueItem]:
+    def get_pending_items(self, session_id: Optional[str] = None) -> List[QueueItem]:
         """
         Get all pending items sorted by order.
 
         If page_id is set on the queue, only returns items for that page.
-        This ensures strict multi-page isolation.
+        If session_id is provided, only returns items for that session.
+        This ensures strict multi-page and multi-session isolation.
+
+        Args:
+            session_id: Optional session ID to filter by (creator mode)
         """
-        if self.page_id:
+        if self.page_id and session_id:
+            # Filter by both page_id and session_id (creator mode)
+            pending = [item for item in self.items
+                       if item.status == "pending"
+                       and item.page_id == self.page_id
+                       and item.session_id == session_id]
+        elif self.page_id:
+            # Filter by page_id only (non-creator mode)
             pending = [item for item in self.items
                        if item.status == "pending" and item.page_id == self.page_id]
         else:

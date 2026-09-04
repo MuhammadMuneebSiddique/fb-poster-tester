@@ -40,6 +40,38 @@ class PromptUI:
                 continue
 
     @staticmethod
+    def ask_video_count_for_profile(total_found: int) -> int:
+        """
+        Prompt user for how many videos to select from discovered profile.
+
+        Args:
+            total_found: Total number of videos discovered from the profile
+
+        Returns:
+            Number of videos user wants to select for posting
+        """
+        console.print(f"\n[success]{ICONS['check']} Found {total_found} videos from this profile.[/success]")
+        console.print(f"[dim]Videos are sorted chronologically (oldest first).[/dim]\n")
+
+        while True:
+            try:
+                num = IntPrompt.ask(
+                    f"[cyan]How many videos would you like to select for posting?[/cyan]",
+                    default=min(total_found, 50),
+                    show_default=True
+                )
+                if num < 1:
+                    console.print(f"[warning]{ICONS['warning']} Number must be at least 1[/warning]")
+                    continue
+                if num > total_found:
+                    console.print(f"[warning]{ICONS['warning']} Cannot exceed discovered videos ({total_found})[/warning]")
+                    continue
+                return num
+            except Exception:
+                console.print(f"[error]{ICONS['x']} Invalid number. Please enter a positive integer.[/error]")
+                continue
+
+    @staticmethod
     def ask_time(post_num: int, total_posts: int) -> dt_time:
         """Prompt user for a posting time in HH:MM format."""
         console.print(f"\n[header]{ICONS['clock'] if 'clock' in ICONS else '⏰'} Post {post_num} of {total_posts}[/header]")
