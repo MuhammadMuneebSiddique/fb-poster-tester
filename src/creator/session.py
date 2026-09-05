@@ -505,13 +505,18 @@ class SessionManager:
         return self.save_session(session)
 
     def mark_video_posted(self, video_id: str, content_id: str = None) -> bool:
-        """Mark a video as successfully posted."""
+        """Mark a video as successfully posted by video_id."""
+        import logging
+        logger = logging.getLogger('creator.session')
+
         session = self.load_session()
         if not session:
+            logger.warning(f"[SESSION] mark_video_posted: Could not load session")
             return False
 
         video = session.get_video_by_id(video_id)
         if not video:
+            logger.warning(f"[SESSION] mark_video_posted: Video not found for video_id={video_id}")
             return False
 
         video.status = VideoStatus.POSTED
@@ -526,7 +531,11 @@ class SessionManager:
         session.resume_point = session.current_progress
         session.last_post_time = video.posted_at
 
-        return self.save_session(session)
+        result = self.save_session(session)
+        if result:
+            logger.info(f"[SESSION] Video {video.video_id} marked POSTED - Saving session: {session.total_videos} total, {len(session.posted_videos)} posted, {session.get_pending_count()} pending")
+            logger.info(f"[SESSION] Session state persisted successfully")
+        return result
 
     def mark_video_failed(self, video_id: str, error_message: str = "") -> bool:
         """Mark a video as failed."""

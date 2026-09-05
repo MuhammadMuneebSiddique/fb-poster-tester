@@ -1798,11 +1798,10 @@ class FacebookAutoPoster:
 
                     # Update session status for page-scoped persistence
                     if self.creator_sync_manager and self.creator_sync_manager.current_session:
-                        # Find video by source_video_id and update its status
-                        self.creator_sync_manager.session_manager.mark_video_posted_by_source(
-                            item.source_video_id or "",
-                            content_id=content_item.id,
-                            platform=item.platform or ""
+                        # Find video by video_id (more reliable than source_video_id) and update its status
+                        self.creator_sync_manager.session_manager.mark_video_posted(
+                            video_id=item.video_id or "",
+                            content_id=content_item.id
                         )
                         self.logger.info(f"[SESSION] Updated video status to POSTED in session for {item.title}")
 
