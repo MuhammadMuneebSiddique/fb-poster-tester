@@ -1797,13 +1797,24 @@ class FacebookAutoPoster:
                     self.posting_queue.mark_as_posted(item.id, content_item.id)
 
                     # Update session status for page-scoped persistence
+                    # Use same identity as PROCESSING: source_video_id + platform
                     if self.creator_sync_manager and self.creator_sync_manager.current_session:
-                        # Find video by video_id (more reliable than source_video_id) and update its status
-                        self.creator_sync_manager.session_manager.mark_video_posted(
-                            video_id=item.video_id or "",
-                            content_id=content_item.id
+                        session_video = self.creator_sync_manager.current_session.get_video_by_source_id(
+                            item.source_video_id or "", item.platform or ""
                         )
-                        self.logger.info(f"[SESSION] Updated video status to POSTED in session for {item.title}")
+                        if session_video:
+                            session_video.status = VideoStatus.POSTED
+                            session_video.content_id = content_item.id
+                            session_video.posted_at = dt_datetime.now().isoformat()
+                            session_video.last_update_time = session_video.posted_at
+                            if session_video.video_id not in self.creator_sync_manager.current_session.posted_videos:
+                                self.creator_sync_manager.current_session.posted_videos.append(session_video.video_id)
+                            self.creator_sync_manager.session_manager.save_session(self.creator_sync_manager.current_session)
+                            self.logger.info(f"[SESSION] POST SUCCESS identity: queue_video_id={item.video_id}, source_video_id={item.source_video_id}, platform={item.platform}, resolved_session_video_id={session_video.video_id}")
+                            self.logger.info(f"[SESSION] Video {session_video.video_id} marked POSTED - Session: {len(self.creator_sync_manager.current_session.videos)} videos, {len(self.creator_sync_manager.current_session.posted_videos)} posted")
+                            self.logger.info(f"[SESSION] Updated video status to POSTED in session for {item.title}")
+                        else:
+                            self.logger.warning(f"[SESSION] POST SUCCESS: Could not find session video for source_video_id={item.source_video_id}, platform={item.platform}")
 
                     self.logger.info(f"Successfully posted: {item.title}")
                     Messages.print_post_success(content.title)
